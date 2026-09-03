@@ -48,7 +48,8 @@ jobs:
           cp "target/${{ matrix.target }}/release/secret-bridge-mcp" "dist/${{ matrix.archive }}/"
           cp README.md LICENSE "dist/${{ matrix.archive }}/"
           tar -C dist -czf "dist/${{ matrix.archive }}.tar.gz" "${{ matrix.archive }}"
-          shasum -a 256 "dist/${{ matrix.archive }}.tar.gz" > "dist/${{ matrix.archive }}.tar.gz.sha256"
+          cd dist
+          shasum -a 256 "${{ matrix.archive }}.tar.gz" > "${{ matrix.archive }}.tar.gz.sha256"
       - name: Package Windows archive
         if: runner.os == 'Windows'
         shell: pwsh
@@ -60,7 +61,8 @@ jobs:
           $archive = "dist\${{ matrix.archive }}.zip"
           Compress-Archive -Path "$package\*" -DestinationPath $archive
           $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
-          "$hash  ${{ matrix.archive }}.zip" | Out-File "$archive.sha256" -Encoding ascii
+          $checksum = "$hash  ${{ matrix.archive }}.zip`n"
+          [IO.File]::WriteAllText("$archive.sha256", $checksum, [Text.UTF8Encoding]::new($false))
       - name: Attest archive provenance
         uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
         with:
