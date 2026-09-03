@@ -2,6 +2,10 @@
 
 All notable changes to SecretBridge are documented here.
 
+## 0.1.2 - 2026-09-03
+
+- Classified the macOS MCP broker as an accessory UI element so persistent client connections do not create Dock or app-switcher icons.
+
 ## 0.1.1 - 2026-09-03
 
 - Removed the blank translucent startup frame by deferring visibility until content is ready.

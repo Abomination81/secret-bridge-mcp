@@ -732,6 +732,18 @@ pub fn run_desktop(config: AppConfig) -> Result<(), String> {
         })
         .map_err(|error| format!("cannot start protocol worker: {error}"))?;
 
+    #[cfg(target_os = "macos")]
+    let event_loop_builder: Option<eframe::EventLoopBuilderHook> = {
+        use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+
+        Some(Box::new(|builder| {
+            builder.with_activation_policy(ActivationPolicy::Accessory);
+        }))
+    };
+
+    #[cfg(not(target_os = "macos"))]
+    let event_loop_builder = None;
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("SecretBridge")
@@ -743,6 +755,7 @@ pub fn run_desktop(config: AppConfig) -> Result<(), String> {
             .with_always_on_top()
             .with_visible(false),
         renderer: eframe::Renderer::Glow,
+        event_loop_builder,
         ..Default::default()
     };
 
