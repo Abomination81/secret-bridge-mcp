@@ -88,4 +88,5 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: gh release create "${GITHUB_REF_NAME}" dist/* --verify-tag --generate-notes --title "SecretBridge MCP ${GITHUB_REF_NAME}"
