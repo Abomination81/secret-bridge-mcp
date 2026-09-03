@@ -13,8 +13,10 @@ use crate::SERVICE_NAME;
 use crate::{AppConfig, protocol};
 
 const WINDOW_WIDTH: f32 = 520.0;
-const WINDOW_HEIGHT_SECRET: f32 = 620.0;
+const WINDOW_HEIGHT_SECRET: f32 = 640.0;
 const WINDOW_HEIGHT_CONFIRM: f32 = 540.0;
+const WINDOW_INSET: i8 = 4;
+const CONFIRM_ACTIONS_HEIGHT: f32 = 112.0;
 
 const PAGE_BG: Color32 = Color32::from_rgb(2, 7, 4);
 const CARD_BG: Color32 = Color32::from_rgb(8, 17, 10);
@@ -210,7 +212,7 @@ impl SecretBridgeUi {
             "The value stays on this device and out of AI messages",
         );
         Self::request_origin(ui, client);
-        ui.add_space(20.0);
+        ui.add_space(16.0);
 
         ui.label(RichText::new("SECRET").size(11.0).strong().color(MUTED_2));
         ui.add_space(7.0);
@@ -287,8 +289,7 @@ impl SecretBridgeUi {
                     .color(MUTED_2),
             );
         }
-
-        ui.add_space(24.0);
+        ui.add_space(10.0);
         Frame::new()
             .fill(Color32::from_rgb(15, 29, 31))
             .corner_radius(CornerRadius::same(10))
@@ -306,48 +307,44 @@ impl SecretBridgeUi {
                     );
                 });
             });
-
-        ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
-            Self::brand_footer(ui);
-            ui.add_space(13.0);
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("Cancel").size(13.0).color(MUTED)).frame(false),
-                )
-                .clicked()
-            {
-                self.close(&ctx);
-            }
-            ui.add_space(10.0);
-            let enabled = !self.secret.is_empty() && self.secret.len() <= 65_536;
-            let button = egui::Button::new(
-                RichText::new(if replacing {
-                    "Replace secret securely"
-                } else {
-                    "Store secret securely"
-                })
-                .size(15.0)
-                .strong()
-                .color(if enabled { ON_PRIMARY } else { MUTED_2 }),
-            )
-            .fill(if enabled { PRIMARY } else { MUTED_BG })
-            .corner_radius(CornerRadius::same(11))
-            .stroke(Stroke::NONE)
-            .min_size(Vec2::new(ui.available_width(), 50.0));
-            let response = ui.add_enabled(enabled, button);
-            if enabled && response.hovered() {
-                ui.painter().rect_stroke(
-                    response.rect,
-                    CornerRadius::same(11),
-                    Stroke::new(1.0, PRIMARY_HOVER),
-                    egui::StrokeKind::Inside,
-                );
-            }
-            if response.clicked() {
-                let secret = Zeroizing::new(std::mem::take(&mut *self.secret));
-                self.finish(&ctx, UiResult::Secret(secret));
-            }
-        });
+        ui.add_space(10.0);
+        let enabled = !self.secret.is_empty() && self.secret.len() <= 65_536;
+        let button = egui::Button::new(
+            RichText::new(if replacing {
+                "Replace secret securely"
+            } else {
+                "Store secret securely"
+            })
+            .size(15.0)
+            .strong()
+            .color(if enabled { ON_PRIMARY } else { MUTED_2 }),
+        )
+        .fill(if enabled { PRIMARY } else { MUTED_BG })
+        .corner_radius(CornerRadius::same(11))
+        .stroke(Stroke::NONE)
+        .min_size(Vec2::new(ui.available_width(), 50.0));
+        let response = ui.add_enabled(enabled, button);
+        if enabled && response.hovered() {
+            ui.painter().rect_stroke(
+                response.rect,
+                CornerRadius::same(11),
+                Stroke::new(1.0, PRIMARY_HOVER),
+                egui::StrokeKind::Inside,
+            );
+        }
+        if response.clicked() {
+            let secret = Zeroizing::new(std::mem::take(&mut *self.secret));
+            self.finish(&ctx, UiResult::Secret(secret));
+        }
+        ui.add_space(3.0);
+        if ui
+            .add(egui::Button::new(RichText::new("Cancel").size(13.0).color(MUTED)).frame(false))
+            .clicked()
+        {
+            self.close(&ctx);
+        }
+        ui.add_space(8.0);
+        Self::brand_footer(ui);
     }
 
     fn confirm_view(
@@ -360,8 +357,9 @@ impl SecretBridgeUi {
     ) {
         self.header(ui, ctx, title, "Review every detail before approving");
         Self::request_origin(ui, client);
-        ui.add_space(20.0);
+        ui.add_space(16.0);
 
+        let message_height = (ui.available_height() - CONFIRM_ACTIONS_HEIGHT - 28.0).max(100.0);
         Frame::new()
             .fill(INPUT_BG)
             .corner_radius(CornerRadius::same(12))
@@ -369,40 +367,37 @@ impl SecretBridgeUi {
             .inner_margin(Margin::same(14))
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
-                    .max_height(245.0)
+                    .max_height(message_height)
+                    .min_scrolled_height(message_height)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.label(RichText::new(message).size(13.0).color(TEXT));
                     });
             });
-
-        ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
-            Self::brand_footer(ui);
-            ui.add_space(13.0);
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("Cancel").size(13.0).color(MUTED)).frame(false),
-                )
-                .clicked()
-            {
-                self.close(ctx);
-            }
-            ui.add_space(10.0);
-            let approve = ui.add(
-                egui::Button::new(
-                    RichText::new("Approve")
-                        .size(15.0)
-                        .strong()
-                        .color(ON_PRIMARY),
-                )
-                .fill(PRIMARY)
-                .corner_radius(CornerRadius::same(11))
-                .min_size(Vec2::new(ui.available_width(), 50.0)),
-            );
-            if approve.clicked() {
-                self.finish(ctx, UiResult::Approved);
-            }
-        });
+        ui.add_space(10.0);
+        let approve = ui.add(
+            egui::Button::new(
+                RichText::new("Approve")
+                    .size(15.0)
+                    .strong()
+                    .color(ON_PRIMARY),
+            )
+            .fill(PRIMARY)
+            .corner_radius(CornerRadius::same(11))
+            .min_size(Vec2::new(ui.available_width(), 50.0)),
+        );
+        if approve.clicked() {
+            self.finish(ctx, UiResult::Approved);
+        }
+        ui.add_space(3.0);
+        if ui
+            .add(egui::Button::new(RichText::new("Cancel").size(13.0).color(MUTED)).frame(false))
+            .clicked()
+        {
+            self.close(ctx);
+        }
+        ui.add_space(8.0);
+        Self::brand_footer(ui);
     }
 
     fn receive_request(&mut self, ctx: &egui::Context) {
@@ -424,15 +419,6 @@ impl SecretBridgeUi {
                 replacing,
                 reply,
             } => {
-                let entry_check = keyring::Entry::new(SERVICE_NAME, &secret_id)
-                    .map_err(|_| {
-                        "could not access the operating-system credential store".to_string()
-                    })
-                    .and_then(|entry| ensure_entry_is_empty(&entry));
-                if let Err(error) = entry_check {
-                    let _ = reply.send(UiReply::Secret(Err(error)));
-                    return;
-                }
                 let guard = match SecureInputGuard::try_new() {
                     Ok(guard) => guard,
                     Err(error) => {
@@ -489,21 +475,32 @@ impl SecretBridgeUi {
         let Some(reply) = self.reply.take() else {
             return;
         };
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         match (mode, outcome) {
             (Mode::Secret { secret_id, .. }, UiResult::Secret(secret)) => {
-                let result = keyring::Entry::new(SERVICE_NAME, &secret_id)
-                    .map_err(|_| {
-                        "could not access the operating-system credential store".to_string()
-                    })
-                    .and_then(|entry| {
-                        ensure_entry_is_empty(&entry)?;
-                        entry.set_password(&secret).map_err(|_| {
-                            "could not store the secret in the operating-system credential store"
-                                .to_string()
-                        })?;
-                        Ok(true)
+                let error_reply = reply.clone();
+                let spawn_result = thread::Builder::new()
+                    .name("secret-bridge-credential-store".into())
+                    .spawn(move || {
+                        let result = keyring::Entry::new(SERVICE_NAME, &secret_id)
+                            .map_err(|_| {
+                                "could not access the operating-system credential store".to_string()
+                            })
+                            .and_then(|entry| {
+                                ensure_entry_is_empty(&entry)?;
+                                entry.set_password(&secret).map_err(|_| {
+                                    "could not store the secret in the operating-system credential store"
+                                        .to_string()
+                                })?;
+                                Ok(true)
+                            });
+                        let _ = reply.send(UiReply::Secret(result));
                     });
-                let _ = reply.send(UiReply::Secret(result));
+                if let Err(error) = spawn_result {
+                    let _ = error_reply.send(UiReply::Secret(Err(format!(
+                        "could not start the credential storage worker: {error}"
+                    ))));
+                }
             }
             (Mode::Secret { .. }, UiResult::Cancelled) => {
                 let _ = reply.send(UiReply::Secret(Ok(false)));
@@ -524,11 +521,14 @@ impl SecretBridgeUi {
         self.secret.zeroize();
         self.clipboard_cleared = false;
         self._secure_input = None;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
     }
 }
 
 impl eframe::App for SecretBridgeUi {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        Color32::TRANSPARENT.to_normalized_gamma_f32()
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         ctx.request_repaint_after(Duration::from_millis(50));
@@ -555,6 +555,7 @@ impl eframe::App for SecretBridgeUi {
                     .fill(CARD_BG)
                     .corner_radius(CornerRadius::same(24))
                     .stroke(Stroke::new(1.0, BORDER))
+                    .outer_margin(Margin::same(WINDOW_INSET))
                     .inner_margin(Margin::same(24)),
             )
             .show(ui, |ui| {
@@ -738,6 +739,7 @@ pub fn run_desktop(config: AppConfig) -> Result<(), String> {
             .with_resizable(false)
             .with_decorations(false)
             .with_transparent(true)
+            .with_has_shadow(false)
             .with_always_on_top()
             .with_visible(false),
         renderer: eframe::Renderer::Glow,
