@@ -1,4 +1,4 @@
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::mpsc::{self, Sender, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -82,24 +82,31 @@ static UI_REQUESTS: OnceLock<Sender<UiRequest>> = OnceLock::new();
 
 struct SecretBridgeUi {
     mode: Option<Mode>,
-    receiver: Receiver<UiRequest>,
     reply: Option<SyncSender<UiReply>>,
     completed: Option<UiResult>,
     secret: Zeroizing<String>,
     clipboard_cleared: bool,
     _secure_input: Option<SecureInputGuard>,
+    window_size: Vec2,
+    shown: bool,
 }
 
 impl SecretBridgeUi {
-    fn new(receiver: Receiver<UiRequest>) -> Self {
+    fn new(
+        mode: Mode,
+        reply: SyncSender<UiReply>,
+        secure_input: Option<SecureInputGuard>,
+        window_size: Vec2,
+    ) -> Self {
         Self {
-            mode: None,
-            receiver,
-            reply: None,
+            mode: Some(mode),
+            reply: Some(reply),
             completed: None,
             secret: Zeroizing::new(String::new()),
             clipboard_cleared: false,
-            _secure_input: None,
+            _secure_input: secure_input,
+            window_size,
+            shown: false,
         }
     }
 
@@ -400,69 +407,32 @@ impl SecretBridgeUi {
         Self::brand_footer(ui);
     }
 
-    fn receive_request(&mut self, ctx: &egui::Context) {
-        let request = match self.receiver.try_recv() {
-            Ok(request) => request,
-            Err(mpsc::TryRecvError::Empty) => return,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                return;
-            }
-        };
-        match request {
-            UiRequest::Secret {
-                secret_id,
-                client,
-                label,
-                description,
-                env_var,
-                replacing,
-                reply,
-            } => {
-                let guard = match SecureInputGuard::try_new() {
-                    Ok(guard) => guard,
-                    Err(error) => {
-                        let _ = reply.send(UiReply::Secret(Err(error)));
-                        return;
-                    }
-                };
-                self.mode = Some(Mode::Secret {
-                    secret_id,
-                    client,
-                    label,
-                    description,
-                    env_var,
-                    replacing,
-                });
-                self.reply = Some(reply);
-                self._secure_input = Some(guard);
-                self.show(ctx, WINDOW_HEIGHT_SECRET);
-            }
-            UiRequest::Confirm {
-                client,
-                title,
-                message,
-                reply,
-            } => {
-                self.mode = Some(Mode::Confirm {
-                    client,
-                    title,
-                    message,
-                });
-                self.reply = Some(reply);
-                self.show(ctx, WINDOW_HEIGHT_CONFIRM);
-            }
-            UiRequest::Shutdown => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+    fn show(&self, ctx: &egui::Context) {
+        if let Some(monitor_size) = ctx.input(|input| input.viewport().monitor_size) {
+            let position = egui::Pos2::new(
+                ((monitor_size.x - self.window_size.x) / 2.0).max(0.0),
+                ((monitor_size.y - self.window_size.y) / 2.0).max(0.0),
+            );
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
         }
-    }
-
-    fn show(&self, ctx: &egui::Context, height: f32) {
-        let size = Vec2::new(WINDOW_WIDTH, height);
-        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(size));
-        ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(size));
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            egui::WindowLevel::AlwaysOnTop,
+        ));
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    fn dismiss(ctx: &egui::Context) {
+        // Disable hit-testing before teardown. On macOS this maps to
+        // NSWindow.setIgnoresMouseEvents(true), so the surface cannot intercept clicks while
+        // visibility and close commands propagate through the window server.
+        ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            egui::WindowLevel::Normal,
+        ));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
     fn complete_request(&mut self, ctx: &egui::Context) {
@@ -475,7 +445,7 @@ impl SecretBridgeUi {
         let Some(reply) = self.reply.take() else {
             return;
         };
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        Self::dismiss(ctx);
         match (mode, outcome) {
             (Mode::Secret { secret_id, .. }, UiResult::Secret(secret)) => {
                 let error_reply = reply.clone();
@@ -533,9 +503,7 @@ impl eframe::App for SecretBridgeUi {
         let ctx = ui.ctx().clone();
         ctx.request_repaint_after(Duration::from_millis(50));
         if self.mode.is_none() {
-            self.receive_request(&ctx);
-        }
-        if self.mode.is_none() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
         let mut visuals = egui::Visuals::dark();
@@ -584,6 +552,10 @@ impl eframe::App for SecretBridgeUi {
                 }
                 self.mode = Some(mode);
             });
+        if !self.shown {
+            self.show(&ctx);
+            self.shown = true;
+        }
         self.complete_request(&ctx);
     }
 }
@@ -732,6 +704,73 @@ pub fn run_desktop(config: AppConfig) -> Result<(), String> {
         })
         .map_err(|error| format!("cannot start protocol worker: {error}"))?;
 
+    loop {
+        let request = receiver
+            .recv()
+            .map_err(|_| "native UI request channel stopped".to_string())?;
+        match request {
+            UiRequest::Secret {
+                secret_id,
+                client,
+                label,
+                description,
+                env_var,
+                replacing,
+                reply,
+            } => {
+                let guard = match SecureInputGuard::try_new() {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        let _ = reply.send(UiReply::Secret(Err(error)));
+                        continue;
+                    }
+                };
+                run_request_window(
+                    Mode::Secret {
+                        secret_id,
+                        client,
+                        label,
+                        description,
+                        env_var,
+                        replacing,
+                    },
+                    reply,
+                    Some(guard),
+                    WINDOW_HEIGHT_SECRET,
+                )?;
+            }
+            UiRequest::Confirm {
+                client,
+                title,
+                message,
+                reply,
+            } => run_request_window(
+                Mode::Confirm {
+                    client,
+                    title,
+                    message,
+                },
+                reply,
+                None,
+                WINDOW_HEIGHT_CONFIRM,
+            )?,
+            UiRequest::Shutdown => break,
+        }
+    }
+
+    protocol_result
+        .lock()
+        .map_err(|_| "protocol result channel failed".to_string())?
+        .take()
+        .ok_or_else(|| "SecretBridge UI stopped before the protocol worker".to_string())?
+}
+
+fn run_request_window(
+    mode: Mode,
+    reply: SyncSender<UiReply>,
+    secure_input: Option<SecureInputGuard>,
+    height: f32,
+) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let event_loop_builder: Option<eframe::EventLoopBuilderHook> = {
         use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
@@ -744,15 +783,17 @@ pub fn run_desktop(config: AppConfig) -> Result<(), String> {
     #[cfg(not(target_os = "macos"))]
     let event_loop_builder = None;
 
+    let window_size = Vec2::new(WINDOW_WIDTH, height);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("SecretBridge")
-            .with_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT_SECRET])
+            .with_inner_size(window_size)
             .with_resizable(false)
             .with_decorations(false)
             .with_transparent(true)
             .with_has_shadow(false)
-            .with_always_on_top()
+            .with_window_level(egui::WindowLevel::Normal)
+            .with_mouse_passthrough(true)
             .with_visible(false),
         renderer: eframe::Renderer::Glow,
         event_loop_builder,
@@ -762,15 +803,16 @@ pub fn run_desktop(config: AppConfig) -> Result<(), String> {
     eframe::run_native(
         "SecretBridge",
         options,
-        Box::new(move |_creation_context| Ok(Box::new(SecretBridgeUi::new(receiver)))),
+        Box::new(move |_creation_context| {
+            Ok(Box::new(SecretBridgeUi::new(
+                mode,
+                reply,
+                secure_input,
+                window_size,
+            )))
+        }),
     )
-    .map_err(|error| format!("SecretBridge UI failed: {error}"))?;
-
-    protocol_result
-        .lock()
-        .map_err(|_| "protocol result channel failed".to_string())?
-        .take()
-        .ok_or_else(|| "SecretBridge UI stopped before the protocol worker".to_string())?
+    .map_err(|error| format!("SecretBridge UI failed: {error}"))
 }
 
 #[cfg(target_os = "macos")]
@@ -814,5 +856,40 @@ struct SecureInputGuard;
 impl SecureInputGuard {
     fn try_new() -> Result<Self, String> {
         Ok(Self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dismissal_disables_hit_testing_before_closing_the_window() {
+        let context = egui::Context::default();
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            SecretBridgeUi::dismiss(ui.ctx());
+        });
+        let commands = &output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .expect("root viewport output")
+            .commands;
+
+        let command_index = |expected: &egui::ViewportCommand| {
+            commands
+                .iter()
+                .position(|command| command == expected)
+                .unwrap_or_else(|| panic!("missing viewport command: {expected:?}"))
+        };
+        let passthrough = command_index(&egui::ViewportCommand::MousePassthrough(true));
+        let hidden = command_index(&egui::ViewportCommand::Visible(false));
+        let normal_level = command_index(&egui::ViewportCommand::WindowLevel(
+            egui::WindowLevel::Normal,
+        ));
+        let closed = command_index(&egui::ViewportCommand::Close);
+
+        assert!(passthrough < hidden);
+        assert!(hidden < normal_level);
+        assert!(normal_level < closed);
     }
 }

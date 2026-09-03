@@ -96,7 +96,7 @@ Install a current stable Rust toolchain, then run:
 cargo build --locked --release
 ```
 
-The build produces one executable: `secret-bridge-mcp` (or `secret-bridge-mcp.exe` on Windows). The already-running broker opens its native UI and stores the value directly in the OS credential store. There is no child process, stdout receipt channel, or sibling helper binary that can be swapped or invoked to print a secret.
+The build produces one executable: `secret-bridge-mcp` (or `secret-bridge-mcp.exe` on Windows). A connected broker owns no native window while idle. It creates a window only for an active request and destroys that window immediately after submission or cancellation. The broker stores the value directly in the OS credential store. There is no child process, stdout receipt channel, or sibling helper binary that can be swapped or invoked to print a secret.
 
 Convenience installers build the locked dependency graph from source and copy the executable to a user-local directory:
 

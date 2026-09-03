@@ -2,6 +2,13 @@
 
 All notable changes to SecretBridge are documented here.
 
+## 0.1.3 - 2026-09-03
+
+- Removed the persistent hidden native window from idle MCP broker processes.
+- Native windows are now created only for an active prompt and destroyed immediately after submission or cancellation.
+- Added mouse-passthrough-before-close teardown and a regression test that enforces the command order.
+- Verified with three simultaneous macOS brokers that idle processes own zero WindowServer surfaces.
+
 ## 0.1.2 - 2026-09-03
 
 - Classified the macOS MCP broker as an accessory UI element so persistent client connections do not create Dock or app-switcher icons.

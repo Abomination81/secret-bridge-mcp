@@ -41,6 +41,7 @@ Not trusted:
 
 - No API can reveal a raw value.
 - The popup never writes a value to stdout, an environment variable, a command argument, or an IPC channel. Its result stays inside the broker process.
+- Idle broker processes own no native windows. A prompt window is created on demand, made mouse-active only when shown, made click-through before teardown, and destroyed after completion or cancellation.
 - Every creation and replacement gets a fresh random credential ID. The broker refuses to overwrite an existing ID.
 - The server uses local stdio and opens no listening socket.
 - Native secret entry uses a masked password field.
