@@ -1,0 +1,12 @@
+/target/
+/.idea/
+/.vscode/
+.DS_Store
+
+# SecretBridge can only write these after a local approval.
+.env*
+.dev.vars
+!.env.example
+!.env.sample
+!.env.template
+!.env.dist

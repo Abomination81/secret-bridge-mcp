@@ -1,0 +1,771 @@
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::Duration;
+
+use eframe::egui::{
+    self, Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Stroke, TextEdit,
+    Vec2,
+};
+use zeroize::{Zeroize, Zeroizing};
+
+use crate::SERVICE_NAME;
+use crate::{AppConfig, protocol};
+
+const WINDOW_WIDTH: f32 = 520.0;
+const WINDOW_HEIGHT_SECRET: f32 = 620.0;
+const WINDOW_HEIGHT_CONFIRM: f32 = 540.0;
+
+const PAGE_BG: Color32 = Color32::from_rgb(9, 13, 15);
+const CARD_BG: Color32 = Color32::from_rgb(20, 25, 28);
+const INPUT_BG: Color32 = Color32::from_rgb(15, 20, 23);
+const MUTED_BG: Color32 = Color32::from_rgb(28, 35, 39);
+const BORDER: Color32 = Color32::from_rgb(45, 56, 61);
+const BORDER_SOFT: Color32 = Color32::from_rgb(35, 44, 48);
+const TEXT: Color32 = Color32::from_rgb(243, 246, 247);
+const MUTED: Color32 = Color32::from_rgb(139, 151, 158);
+const MUTED_2: Color32 = Color32::from_rgb(101, 116, 124);
+const PRIMARY: Color32 = Color32::from_rgb(31, 111, 178);
+const PRIMARY_HOVER: Color32 = Color32::from_rgb(39, 128, 204);
+const SUCCESS: Color32 = Color32::from_rgb(69, 190, 134);
+
+enum Mode {
+    Secret {
+        secret_id: String,
+        client: String,
+        label: String,
+        description: String,
+        env_var: Option<String>,
+        replacing: bool,
+    },
+    Confirm {
+        client: String,
+        title: String,
+        message: String,
+    },
+}
+
+enum UiResult {
+    Secret(Zeroizing<String>),
+    Approved,
+    Cancelled,
+}
+
+enum UiReply {
+    Secret(Result<bool, String>),
+    Confirm(bool),
+}
+
+enum UiRequest {
+    Secret {
+        secret_id: String,
+        client: String,
+        label: String,
+        description: String,
+        env_var: Option<String>,
+        replacing: bool,
+        reply: SyncSender<UiReply>,
+    },
+    Confirm {
+        client: String,
+        title: String,
+        message: String,
+        reply: SyncSender<UiReply>,
+    },
+    Shutdown,
+}
+
+static UI_REQUESTS: OnceLock<Sender<UiRequest>> = OnceLock::new();
+
+struct SecretBridgeUi {
+    mode: Option<Mode>,
+    receiver: Receiver<UiRequest>,
+    reply: Option<SyncSender<UiReply>>,
+    completed: Option<UiResult>,
+    secret: Zeroizing<String>,
+    clipboard_cleared: bool,
+    _secure_input: Option<SecureInputGuard>,
+}
+
+impl SecretBridgeUi {
+    fn new(receiver: Receiver<UiRequest>) -> Self {
+        Self {
+            mode: None,
+            receiver,
+            reply: None,
+            completed: None,
+            secret: Zeroizing::new(String::new()),
+            clipboard_cleared: false,
+            _secure_input: None,
+        }
+    }
+
+    fn finish(&mut self, ctx: &egui::Context, result: UiResult) {
+        self.completed = Some(result);
+        ctx.request_repaint();
+    }
+
+    fn close(&mut self, ctx: &egui::Context) {
+        self.secret.zeroize();
+        self.finish(ctx, UiResult::Cancelled);
+    }
+
+    fn header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, title: &str, subtitle: &str) {
+        let drag_rect = ui.available_rect_before_wrap();
+        let drag_rect =
+            egui::Rect::from_min_size(drag_rect.min, Vec2::new(drag_rect.width(), 58.0));
+        let drag = ui.interact(drag_rect, ui.id().with("title_drag"), egui::Sense::drag());
+        if drag.drag_started() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new(title).size(20.0).strong().color(TEXT));
+                ui.add_space(3.0);
+                ui.label(RichText::new(subtitle).size(13.0).color(MUTED));
+            });
+            ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+                let close = ui.add(
+                    egui::Button::new(RichText::new("×").size(25.0).color(MUTED))
+                        .frame(false)
+                        .min_size(Vec2::new(32.0, 32.0)),
+                );
+                if close.on_hover_text("Cancel and close").clicked() {
+                    self.close(ctx);
+                }
+            });
+        });
+        ui.add_space(18.0);
+    }
+
+    fn request_origin(ui: &mut egui::Ui, client: &str) {
+        ui.label(
+            RichText::new("CLAIMED REQUESTER")
+                .size(11.0)
+                .strong()
+                .color(MUTED_2),
+        );
+        ui.add_space(7.0);
+        Frame::new()
+            .fill(MUTED_BG)
+            .corner_radius(CornerRadius::same(10))
+            .stroke(Stroke::new(1.0, BORDER_SOFT))
+            .inner_margin(Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.colored_label(SUCCESS, "●");
+                    ui.label(RichText::new(client).size(13.0).color(TEXT));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new("Unverified local process")
+                                .size(12.0)
+                                .color(MUTED),
+                        );
+                    });
+                });
+            });
+    }
+
+    fn secret_view(
+        &mut self,
+        ui: &mut egui::Ui,
+        client: &str,
+        label: &str,
+        description: &str,
+        env_var: Option<&str>,
+        replacing: bool,
+    ) {
+        let ctx = ui.ctx().clone();
+        self.header(
+            ui,
+            &ctx,
+            if replacing {
+                "Replace stored secret"
+            } else {
+                "Secure secret entry"
+            },
+            "The value stays on this device and out of AI messages",
+        );
+        Self::request_origin(ui, client);
+        ui.add_space(20.0);
+
+        ui.label(RichText::new("SECRET").size(11.0).strong().color(MUTED_2));
+        ui.add_space(7.0);
+        ui.label(RichText::new(label).size(16.0).strong().color(TEXT));
+        ui.add_space(5.0);
+        ui.label(RichText::new(description).size(13.0).color(MUTED));
+
+        if let Some(env_var) = env_var {
+            ui.add_space(10.0);
+            Frame::new()
+                .fill(MUTED_BG)
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!("ENV  {env_var}"))
+                            .monospace()
+                            .size(12.0)
+                            .color(MUTED),
+                    );
+                });
+        }
+
+        ui.add_space(22.0);
+        ui.label(
+            RichText::new("Paste or enter secret")
+                .size(14.0)
+                .color(TEXT),
+        );
+        ui.add_space(8.0);
+        Frame::new()
+            .fill(INPUT_BG)
+            .corner_radius(CornerRadius::same(12))
+            .stroke(Stroke::new(1.0, BORDER))
+            .inner_margin(Margin::symmetric(14, 10))
+            .show(ui, |ui| {
+                let input = ui.add_sized(
+                    [ui.available_width(), 34.0],
+                    TextEdit::singleline(&mut *self.secret)
+                        .password(true)
+                        .hint_text("Secret value")
+                        .text_color(TEXT)
+                        .font(FontId::monospace(15.0))
+                        .frame(Frame::NONE),
+                );
+                if self.secret.is_empty() {
+                    input.request_focus();
+                }
+            });
+        let pasted = ctx.input(|input| {
+            input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Paste(_)))
+        });
+        if pasted {
+            ctx.copy_text(String::new());
+            self.clipboard_cleared = true;
+        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.colored_label(SUCCESS, "●");
+            ui.label(RichText::new(vault_message()).size(12.0).color(MUTED));
+        });
+        ui.label(
+            RichText::new("Stored locally; approved .env exports are readable local files.")
+                .size(11.0)
+                .color(MUTED_2),
+        );
+        if self.clipboard_cleared {
+            ui.label(
+                RichText::new("Clipboard cleared after paste")
+                    .size(11.0)
+                    .color(MUTED_2),
+            );
+        }
+
+        ui.add_space(24.0);
+        Frame::new()
+            .fill(Color32::from_rgb(15, 29, 31))
+            .corner_radius(CornerRadius::same(10))
+            .stroke(Stroke::new(1.0, Color32::from_rgb(31, 65, 61)))
+            .inner_margin(Margin::same(12))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("✓").size(14.0).strong().color(SUCCESS));
+                    ui.label(
+                        RichText::new(
+                            "The AI receives only a confirmation and an opaque secret ID.",
+                        )
+                        .size(12.0)
+                        .color(Color32::from_rgb(172, 197, 193)),
+                    );
+                });
+            });
+
+        ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
+            let enabled = !self.secret.is_empty() && self.secret.len() <= 65_536;
+            let button = egui::Button::new(
+                RichText::new(if replacing {
+                    "Replace secret securely"
+                } else {
+                    "Store secret securely"
+                })
+                .size(15.0)
+                .strong()
+                .color(if enabled { TEXT } else { MUTED_2 }),
+            )
+            .fill(if enabled { PRIMARY } else { MUTED_BG })
+            .corner_radius(CornerRadius::same(11))
+            .stroke(Stroke::NONE)
+            .min_size(Vec2::new(ui.available_width(), 50.0));
+            let response = ui.add_enabled(enabled, button);
+            if enabled && response.hovered() {
+                ui.painter().rect_stroke(
+                    response.rect,
+                    CornerRadius::same(11),
+                    Stroke::new(1.0, PRIMARY_HOVER),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            if response.clicked() {
+                let secret = Zeroizing::new(std::mem::take(&mut *self.secret));
+                self.finish(&ctx, UiResult::Secret(secret));
+            }
+            ui.add_space(10.0);
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("Cancel").size(13.0).color(MUTED)).frame(false),
+                )
+                .clicked()
+            {
+                self.close(&ctx);
+            }
+        });
+    }
+
+    fn confirm_view(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        client: &str,
+        title: &str,
+        message: &str,
+    ) {
+        self.header(ui, ctx, title, "Review every detail before approving");
+        Self::request_origin(ui, client);
+        ui.add_space(20.0);
+
+        Frame::new()
+            .fill(INPUT_BG)
+            .corner_radius(CornerRadius::same(12))
+            .stroke(Stroke::new(1.0, BORDER))
+            .inner_margin(Margin::same(14))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(245.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(message).size(13.0).color(TEXT));
+                    });
+            });
+
+        ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
+            let approve = ui.add(
+                egui::Button::new(RichText::new("Approve").size(15.0).strong().color(TEXT))
+                    .fill(PRIMARY)
+                    .corner_radius(CornerRadius::same(11))
+                    .min_size(Vec2::new(ui.available_width(), 50.0)),
+            );
+            if approve.clicked() {
+                self.finish(ctx, UiResult::Approved);
+            }
+            ui.add_space(10.0);
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("Cancel").size(13.0).color(MUTED)).frame(false),
+                )
+                .clicked()
+            {
+                self.close(ctx);
+            }
+        });
+    }
+
+    fn receive_request(&mut self, ctx: &egui::Context) {
+        let request = match self.receiver.try_recv() {
+            Ok(request) => request,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
+        };
+        match request {
+            UiRequest::Secret {
+                secret_id,
+                client,
+                label,
+                description,
+                env_var,
+                replacing,
+                reply,
+            } => {
+                let entry_check = keyring::Entry::new(SERVICE_NAME, &secret_id)
+                    .map_err(|_| {
+                        "could not access the operating-system credential store".to_string()
+                    })
+                    .and_then(|entry| ensure_entry_is_empty(&entry));
+                if let Err(error) = entry_check {
+                    let _ = reply.send(UiReply::Secret(Err(error)));
+                    return;
+                }
+                let guard = match SecureInputGuard::try_new() {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        let _ = reply.send(UiReply::Secret(Err(error)));
+                        return;
+                    }
+                };
+                self.mode = Some(Mode::Secret {
+                    secret_id,
+                    client,
+                    label,
+                    description,
+                    env_var,
+                    replacing,
+                });
+                self.reply = Some(reply);
+                self._secure_input = Some(guard);
+                self.show(ctx, WINDOW_HEIGHT_SECRET);
+            }
+            UiRequest::Confirm {
+                client,
+                title,
+                message,
+                reply,
+            } => {
+                self.mode = Some(Mode::Confirm {
+                    client,
+                    title,
+                    message,
+                });
+                self.reply = Some(reply);
+                self.show(ctx, WINDOW_HEIGHT_CONFIRM);
+            }
+            UiRequest::Shutdown => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+        }
+    }
+
+    fn show(&self, ctx: &egui::Context, height: f32) {
+        let size = Vec2::new(WINDOW_WIDTH, height);
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(size));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(size));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    fn complete_request(&mut self, ctx: &egui::Context) {
+        let Some(outcome) = self.completed.take() else {
+            return;
+        };
+        let Some(mode) = self.mode.take() else {
+            return;
+        };
+        let Some(reply) = self.reply.take() else {
+            return;
+        };
+        match (mode, outcome) {
+            (Mode::Secret { secret_id, .. }, UiResult::Secret(secret)) => {
+                let result = keyring::Entry::new(SERVICE_NAME, &secret_id)
+                    .map_err(|_| {
+                        "could not access the operating-system credential store".to_string()
+                    })
+                    .and_then(|entry| {
+                        ensure_entry_is_empty(&entry)?;
+                        entry.set_password(&secret).map_err(|_| {
+                            "could not store the secret in the operating-system credential store"
+                                .to_string()
+                        })?;
+                        Ok(true)
+                    });
+                let _ = reply.send(UiReply::Secret(result));
+            }
+            (Mode::Secret { .. }, UiResult::Cancelled) => {
+                let _ = reply.send(UiReply::Secret(Ok(false)));
+            }
+            (Mode::Confirm { .. }, UiResult::Approved) => {
+                let _ = reply.send(UiReply::Confirm(true));
+            }
+            (Mode::Confirm { .. }, UiResult::Cancelled) => {
+                let _ = reply.send(UiReply::Confirm(false));
+            }
+            (Mode::Secret { .. }, UiResult::Approved) => {
+                let _ = reply.send(UiReply::Secret(Err("invalid UI result state".into())));
+            }
+            (Mode::Confirm { .. }, UiResult::Secret(_)) => {
+                let _ = reply.send(UiReply::Confirm(false));
+            }
+        }
+        self.secret.zeroize();
+        self.clipboard_cleared = false;
+        self._secure_input = None;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    }
+}
+
+impl eframe::App for SecretBridgeUi {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        ctx.request_repaint_after(Duration::from_millis(50));
+        if self.mode.is_none() {
+            self.receive_request(&ctx);
+        }
+        if self.mode.is_none() {
+            return;
+        }
+        let mut visuals = egui::Visuals::dark();
+        visuals.window_fill = CARD_BG;
+        visuals.panel_fill = PAGE_BG;
+        visuals.override_text_color = Some(TEXT);
+        visuals.selection.bg_fill = PRIMARY;
+        visuals.widgets.inactive.bg_fill = MUTED_BG;
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(36, 45, 50);
+        visuals.widgets.active.bg_fill = PRIMARY;
+        ctx.set_visuals(visuals);
+
+        egui::CentralPanel::default()
+            .frame(
+                Frame::new()
+                    .fill(CARD_BG)
+                    .corner_radius(CornerRadius::same(24))
+                    .stroke(Stroke::new(1.0, BORDER))
+                    .inner_margin(Margin::same(24)),
+            )
+            .show(ui, |ui| {
+                let mode = self.mode.take().expect("mode checked above");
+                match &mode {
+                    Mode::Secret {
+                        secret_id: _,
+                        client,
+                        label,
+                        description,
+                        env_var,
+                        replacing,
+                    } => self.secret_view(
+                        ui,
+                        client,
+                        label,
+                        description,
+                        env_var.as_deref(),
+                        *replacing,
+                    ),
+                    Mode::Confirm {
+                        client,
+                        title,
+                        message,
+                    } => self.confirm_view(ui, &ctx, client, title, message),
+                }
+                self.mode = Some(mode);
+            });
+        self.complete_request(&ctx);
+    }
+}
+
+impl Drop for SecretBridgeUi {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+        if let Some(reply) = self.reply.take() {
+            match self.mode.take() {
+                Some(Mode::Secret { .. }) => {
+                    let _ = reply.send(UiReply::Secret(Err("SecretBridge UI closed".into())));
+                }
+                Some(Mode::Confirm { .. }) => {
+                    let _ = reply.send(UiReply::Confirm(false));
+                }
+                None => {}
+            }
+        }
+    }
+}
+
+fn validate_ui_text(
+    name: &str,
+    value: &str,
+    min: usize,
+    max: usize,
+    allow_newlines: bool,
+) -> Result<(), String> {
+    crate::validation::validate_display_text(name, value, min, max, allow_newlines)
+}
+
+fn valid_env_name(name: &str) -> bool {
+    if name.len() > 128 {
+        return false;
+    }
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_uppercase())
+        && chars.all(|character| {
+            character == '_' || character.is_ascii_uppercase() || character.is_ascii_digit()
+        })
+}
+
+fn valid_secret_id(id: &str) -> bool {
+    crate::validation::valid_secret_id(id)
+}
+
+fn vault_message() -> &'static str {
+    #[cfg(target_os = "macos")]
+    return "Will be stored in macOS Keychain";
+
+    #[cfg(target_os = "windows")]
+    return "Will be stored in Windows Credential Manager";
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    return "Will be stored in the operating-system credential store";
+}
+
+pub(crate) fn prompt_and_store_secret(
+    secret_id: &str,
+    client: &str,
+    label: &str,
+    description: &str,
+    env_var: Option<&str>,
+    replacing: bool,
+) -> Result<bool, String> {
+    if !valid_secret_id(secret_id) {
+        return Err("invalid provisional secret ID".into());
+    }
+    validate_ui_text("client", client, 1, 80, false)?;
+    validate_ui_text("label", label, 3, 120, false)?;
+    validate_ui_text("description", description, 3, 500, true)?;
+    if env_var.is_some_and(|name| !valid_env_name(name)) {
+        return Err("invalid environment variable name".into());
+    }
+    let sender = UI_REQUESTS
+        .get()
+        .ok_or_else(|| "native UI broker is not running".to_string())?;
+    let (reply, response) = mpsc::sync_channel(0);
+    sender
+        .send(UiRequest::Secret {
+            secret_id: secret_id.to_string(),
+            client: client.to_string(),
+            label: label.to_string(),
+            description: description.to_string(),
+            env_var: env_var.map(str::to_string),
+            replacing,
+            reply,
+        })
+        .map_err(|_| "native UI broker stopped".to_string())?;
+    match response.recv().map_err(|_| "native UI broker stopped")? {
+        UiReply::Secret(result) => result,
+        UiReply::Confirm(_) => Err("native UI returned the wrong response type".into()),
+    }
+}
+
+pub(crate) fn confirm(client: &str, title: &str, message: &str) -> Result<bool, String> {
+    validate_ui_text("client", client, 1, 80, false)?;
+    validate_ui_text("title", title, 1, 80, false)?;
+    validate_ui_text("message", message, 1, 12_000, true)?;
+    let sender = UI_REQUESTS
+        .get()
+        .ok_or_else(|| "native UI broker is not running".to_string())?;
+    let (reply, response) = mpsc::sync_channel(0);
+    sender
+        .send(UiRequest::Confirm {
+            client: client.to_string(),
+            title: title.to_string(),
+            message: message.to_string(),
+            reply,
+        })
+        .map_err(|_| "native UI broker stopped".to_string())?;
+    match response.recv().map_err(|_| "native UI broker stopped")? {
+        UiReply::Confirm(approved) => Ok(approved),
+        UiReply::Secret(_) => Err("native UI returned the wrong response type".into()),
+    }
+}
+
+fn ensure_entry_is_empty(entry: &keyring::Entry) -> Result<(), String> {
+    match entry.get_password() {
+        Ok(mut existing) => {
+            existing.zeroize();
+            Err("refusing to overwrite an existing credential ID".into())
+        }
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(_) => Err("operating-system credential lookup failed".into()),
+    }
+}
+
+pub fn run_desktop(config: AppConfig) -> Result<(), String> {
+    let (sender, receiver) = mpsc::channel();
+    UI_REQUESTS
+        .set(sender.clone())
+        .map_err(|_| "native UI broker was initialized twice".to_string())?;
+    let protocol_result = Arc::new(Mutex::new(None));
+    let worker_result = Arc::clone(&protocol_result);
+    thread::Builder::new()
+        .name("secret-bridge-protocol".into())
+        .spawn(move || {
+            let result = protocol::run_stdio(config);
+            if let Ok(mut slot) = worker_result.lock() {
+                *slot = Some(result);
+            }
+            let _ = sender.send(UiRequest::Shutdown);
+        })
+        .map_err(|error| format!("cannot start protocol worker: {error}"))?;
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("SecretBridge")
+            .with_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT_SECRET])
+            .with_resizable(false)
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_always_on_top()
+            .with_visible(false),
+        renderer: eframe::Renderer::Glow,
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "SecretBridge",
+        options,
+        Box::new(move |_creation_context| Ok(Box::new(SecretBridgeUi::new(receiver)))),
+    )
+    .map_err(|error| format!("SecretBridge UI failed: {error}"))?;
+
+    protocol_result
+        .lock()
+        .map_err(|_| "protocol result channel failed".to_string())?
+        .take()
+        .ok_or_else(|| "SecretBridge UI stopped before the protocol worker".to_string())?
+}
+
+#[cfg(target_os = "macos")]
+struct SecureInputGuard(bool);
+
+#[cfg(target_os = "macos")]
+impl SecureInputGuard {
+    fn try_new() -> Result<Self, String> {
+        #[link(name = "Carbon", kind = "framework")]
+        unsafe extern "C" {
+            fn EnableSecureEventInput() -> i32;
+        }
+        // SAFETY: This process owns the secret-entry window and pairs a successful call with
+        // DisableSecureEventInput in Drop.
+        if unsafe { EnableSecureEventInput() } == 0 {
+            Ok(Self(true))
+        } else {
+            Err("macOS Secure Event Input could not be enabled; secret entry was blocked".into())
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for SecureInputGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            #[link(name = "Carbon", kind = "framework")]
+            unsafe extern "C" {
+                fn DisableSecureEventInput() -> i32;
+            }
+            // SAFETY: Balances the successful EnableSecureEventInput call made by new().
+            let _ = unsafe { DisableSecureEventInput() };
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+struct SecureInputGuard;
+
+#[cfg(not(target_os = "macos"))]
+impl SecureInputGuard {
+    fn try_new() -> Result<Self, String> {
+        Ok(Self)
+    }
+}
