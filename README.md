@@ -3,9 +3,15 @@
 [![CI](https://github.com/abomination81/secret-bridge-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/abomination81/secret-bridge-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+**Built by [Abomination81](https://github.com/Abomination81) · [X @Abomination81](https://x.com/Abomination81)**
+
+![SecretBridge MCP — paste secrets into a popup, not your AI chat](docs/assets/secretbridge-hero.svg)
+
 SecretBridge lets an AI request a credential without asking you to paste it into chat. It opens a native password dialog, stores the value in macOS Keychain or Windows Credential Manager, and returns only an opaque ID through MCP. It is a local application: it has no server, account, telemetry, or network listener.
 
 The model can later ask SecretBridge to place selected credentials into an approved local `.env` file. Secret values never appear in MCP requests, responses, labels, metadata, or audit logs.
+
+**[Open the visual installation guide](https://abomination81.github.io/secret-bridge-mcp/)**
 
 ## What it protects
 

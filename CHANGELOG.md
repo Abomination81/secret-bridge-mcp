@@ -10,3 +10,4 @@ All notable changes to SecretBridge are documented here.
 - Added approved, workspace-confined `.env` writing without returning values through MCP.
 - Added secret deletion, metadata-only listing, and local metadata audit records.
 - Added source installers, macOS/Windows CI, dependency auditing, and GitHub release packaging.
+- Added Abomination81 branding, a neon-green native UI, and a responsive GitHub Pages installation site.

@@ -16,18 +16,19 @@ const WINDOW_WIDTH: f32 = 520.0;
 const WINDOW_HEIGHT_SECRET: f32 = 620.0;
 const WINDOW_HEIGHT_CONFIRM: f32 = 540.0;
 
-const PAGE_BG: Color32 = Color32::from_rgb(9, 13, 15);
-const CARD_BG: Color32 = Color32::from_rgb(20, 25, 28);
-const INPUT_BG: Color32 = Color32::from_rgb(15, 20, 23);
-const MUTED_BG: Color32 = Color32::from_rgb(28, 35, 39);
-const BORDER: Color32 = Color32::from_rgb(45, 56, 61);
-const BORDER_SOFT: Color32 = Color32::from_rgb(35, 44, 48);
-const TEXT: Color32 = Color32::from_rgb(243, 246, 247);
-const MUTED: Color32 = Color32::from_rgb(139, 151, 158);
-const MUTED_2: Color32 = Color32::from_rgb(101, 116, 124);
-const PRIMARY: Color32 = Color32::from_rgb(31, 111, 178);
-const PRIMARY_HOVER: Color32 = Color32::from_rgb(39, 128, 204);
-const SUCCESS: Color32 = Color32::from_rgb(69, 190, 134);
+const PAGE_BG: Color32 = Color32::from_rgb(2, 7, 4);
+const CARD_BG: Color32 = Color32::from_rgb(8, 17, 10);
+const INPUT_BG: Color32 = Color32::from_rgb(5, 8, 5);
+const MUTED_BG: Color32 = Color32::from_rgb(13, 26, 16);
+const BORDER: Color32 = Color32::from_rgb(35, 92, 43);
+const BORDER_SOFT: Color32 = Color32::from_rgb(22, 59, 28);
+const TEXT: Color32 = Color32::from_rgb(244, 247, 244);
+const MUTED: Color32 = Color32::from_rgb(184, 195, 186);
+const MUTED_2: Color32 = Color32::from_rgb(116, 135, 118);
+const PRIMARY: Color32 = Color32::from_rgb(57, 255, 20);
+const PRIMARY_HOVER: Color32 = Color32::from_rgb(125, 255, 100);
+const ON_PRIMARY: Color32 = Color32::from_rgb(3, 16, 4);
+const SUCCESS: Color32 = PRIMARY;
 
 enum Mode {
     Secret {
@@ -167,6 +168,27 @@ impl SecretBridgeUi {
             });
     }
 
+    fn brand_footer(ui: &mut egui::Ui) {
+        ui.horizontal_centered(|ui| {
+            ui.label(RichText::new("Built by").size(11.0).color(MUTED_2));
+            ui.hyperlink_to(
+                RichText::new("Abomination81")
+                    .size(11.0)
+                    .strong()
+                    .color(PRIMARY),
+                "https://github.com/Abomination81",
+            );
+            ui.label(RichText::new("·").size(11.0).color(MUTED_2));
+            ui.hyperlink_to(
+                RichText::new("X @Abomination81")
+                    .size(11.0)
+                    .strong()
+                    .color(PRIMARY),
+                "https://x.com/Abomination81",
+            );
+        });
+    }
+
     fn secret_view(
         &mut self,
         ui: &mut egui::Ui,
@@ -286,6 +308,17 @@ impl SecretBridgeUi {
             });
 
         ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
+            Self::brand_footer(ui);
+            ui.add_space(13.0);
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("Cancel").size(13.0).color(MUTED)).frame(false),
+                )
+                .clicked()
+            {
+                self.close(&ctx);
+            }
+            ui.add_space(10.0);
             let enabled = !self.secret.is_empty() && self.secret.len() <= 65_536;
             let button = egui::Button::new(
                 RichText::new(if replacing {
@@ -295,7 +328,7 @@ impl SecretBridgeUi {
                 })
                 .size(15.0)
                 .strong()
-                .color(if enabled { TEXT } else { MUTED_2 }),
+                .color(if enabled { ON_PRIMARY } else { MUTED_2 }),
             )
             .fill(if enabled { PRIMARY } else { MUTED_BG })
             .corner_radius(CornerRadius::same(11))
@@ -313,15 +346,6 @@ impl SecretBridgeUi {
             if response.clicked() {
                 let secret = Zeroizing::new(std::mem::take(&mut *self.secret));
                 self.finish(&ctx, UiResult::Secret(secret));
-            }
-            ui.add_space(10.0);
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("Cancel").size(13.0).color(MUTED)).frame(false),
-                )
-                .clicked()
-            {
-                self.close(&ctx);
             }
         });
     }
@@ -353,16 +377,8 @@ impl SecretBridgeUi {
             });
 
         ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
-            let approve = ui.add(
-                egui::Button::new(RichText::new("Approve").size(15.0).strong().color(TEXT))
-                    .fill(PRIMARY)
-                    .corner_radius(CornerRadius::same(11))
-                    .min_size(Vec2::new(ui.available_width(), 50.0)),
-            );
-            if approve.clicked() {
-                self.finish(ctx, UiResult::Approved);
-            }
-            ui.add_space(10.0);
+            Self::brand_footer(ui);
+            ui.add_space(13.0);
             if ui
                 .add(
                     egui::Button::new(RichText::new("Cancel").size(13.0).color(MUTED)).frame(false),
@@ -370,6 +386,21 @@ impl SecretBridgeUi {
                 .clicked()
             {
                 self.close(ctx);
+            }
+            ui.add_space(10.0);
+            let approve = ui.add(
+                egui::Button::new(
+                    RichText::new("Approve")
+                        .size(15.0)
+                        .strong()
+                        .color(ON_PRIMARY),
+                )
+                .fill(PRIMARY)
+                .corner_radius(CornerRadius::same(11))
+                .min_size(Vec2::new(ui.available_width(), 50.0)),
+            );
+            if approve.clicked() {
+                self.finish(ctx, UiResult::Approved);
             }
         });
     }
@@ -511,9 +542,10 @@ impl eframe::App for SecretBridgeUi {
         visuals.window_fill = CARD_BG;
         visuals.panel_fill = PAGE_BG;
         visuals.override_text_color = Some(TEXT);
+        visuals.hyperlink_color = PRIMARY;
         visuals.selection.bg_fill = PRIMARY;
         visuals.widgets.inactive.bg_fill = MUTED_BG;
-        visuals.widgets.hovered.bg_fill = Color32::from_rgb(36, 45, 50);
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(17, 44, 21);
         visuals.widgets.active.bg_fill = PRIMARY;
         ctx.set_visuals(visuals);
 

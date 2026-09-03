@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 autobins = false
 description = "A local MCP secret broker that keeps secret values out of model context"
+authors = ["Abomination81"]
 license = "MIT"
 rust-version = "1.93"
 repository = "https://github.com/abomination81/secret-bridge-mcp"

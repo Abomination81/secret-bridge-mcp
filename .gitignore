@@ -1,4 +1,6 @@
 /target/
+/output/
+/.playwright-cli/
 /.idea/
 /.vscode/
 .DS_Store
