@@ -1,6 +1,7 @@
 # SecretBridge MCP
 
 [![CI](https://github.com/abomination81/secret-bridge-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/abomination81/secret-bridge-mcp/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Abomination81/secret-bridge-mcp)](https://github.com/Abomination81/secret-bridge-mcp/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 **Built by [Abomination81](https://github.com/Abomination81) · [X @Abomination81](https://x.com/Abomination81)**
