@@ -829,6 +829,11 @@ impl SecureInputGuard {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
+impl Drop for SecureInputGuard {
+    fn drop(&mut self) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2,6 +2,10 @@
 
 All notable changes to SecretBridge are documented here.
 
+## 0.1.5 - 2026-09-04
+
+- Made the secure-input guard an explicit RAII type on Windows as well as macOS, keeping teardown semantics consistent and satisfying the Windows CI lint gate.
+
 ## 0.1.4 - 2026-09-04
 
 - Moved each native prompt into a one-shot child process of the installed SecretBridge executable.
