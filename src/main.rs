@@ -1,8 +1,9 @@
 use std::env;
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use secret_bridge_mcp::{AppConfig, run_desktop};
+use secret_bridge_mcp::{AppConfig, run_desktop, run_native_prompt_child};
 
 fn print_help() {
     eprintln!(
@@ -63,6 +64,13 @@ fn parse_args() -> Result<AppConfig, String> {
 }
 
 fn main() -> ExitCode {
+    if env::args_os().nth(1).as_deref() == Some(OsStr::new("--native-prompt")) {
+        return match run_native_prompt_child() {
+            Ok(code) => ExitCode::from(code),
+            Err(_) => ExitCode::FAILURE,
+        };
+    }
+
     let config = match parse_args() {
         Ok(config) => config,
         Err(error) => {

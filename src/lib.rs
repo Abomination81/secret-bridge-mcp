@@ -9,7 +9,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub use native_ui::run_desktop;
+pub use native_ui::{run_desktop, run_native_prompt_child};
 
 pub const SERVICE_NAME: &str = "dev.secretbridge.mcp";
 

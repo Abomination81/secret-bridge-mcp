@@ -1,5 +1,5 @@
-use std::sync::mpsc::{self, Sender, SyncSender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::io::{Read, Write};
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
@@ -7,6 +7,7 @@ use eframe::egui::{
     self, Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Stroke, TextEdit,
     Vec2,
 };
+use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::SERVICE_NAME;
@@ -17,6 +18,9 @@ const WINDOW_HEIGHT_SECRET: f32 = 640.0;
 const WINDOW_HEIGHT_CONFIRM: f32 = 540.0;
 const WINDOW_INSET: i8 = 4;
 const CONFIRM_ACTIONS_HEIGHT: f32 = 112.0;
+const MAX_PROMPT_REQUEST_BYTES: u64 = 65_536;
+const PROMPT_CANCELLED_EXIT_CODE: u8 = 20;
+const PROMPT_FAILED_EXIT_CODE: i32 = 21;
 
 const PAGE_BG: Color32 = Color32::from_rgb(2, 7, 4);
 const CARD_BG: Color32 = Color32::from_rgb(8, 17, 10);
@@ -32,6 +36,8 @@ const PRIMARY_HOVER: Color32 = Color32::from_rgb(125, 255, 100);
 const ON_PRIMARY: Color32 = Color32::from_rgb(3, 16, 4);
 const SUCCESS: Color32 = PRIMARY;
 
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Mode {
     Secret {
         secret_id: String,
@@ -54,35 +60,8 @@ enum UiResult {
     Cancelled,
 }
 
-enum UiReply {
-    Secret(Result<bool, String>),
-    Confirm(bool),
-}
-
-enum UiRequest {
-    Secret {
-        secret_id: String,
-        client: String,
-        label: String,
-        description: String,
-        env_var: Option<String>,
-        replacing: bool,
-        reply: SyncSender<UiReply>,
-    },
-    Confirm {
-        client: String,
-        title: String,
-        message: String,
-        reply: SyncSender<UiReply>,
-    },
-    Shutdown,
-}
-
-static UI_REQUESTS: OnceLock<Sender<UiRequest>> = OnceLock::new();
-
 struct SecretBridgeUi {
     mode: Option<Mode>,
-    reply: Option<SyncSender<UiReply>>,
     completed: Option<UiResult>,
     secret: Zeroizing<String>,
     clipboard_cleared: bool,
@@ -92,15 +71,9 @@ struct SecretBridgeUi {
 }
 
 impl SecretBridgeUi {
-    fn new(
-        mode: Mode,
-        reply: SyncSender<UiReply>,
-        secure_input: Option<SecureInputGuard>,
-        window_size: Vec2,
-    ) -> Self {
+    fn new(mode: Mode, secure_input: Option<SecureInputGuard>, window_size: Vec2) -> Self {
         Self {
             mode: Some(mode),
-            reply: Some(reply),
             completed: None,
             secret: Zeroizing::new(String::new()),
             clipboard_cleared: false,
@@ -426,13 +399,12 @@ impl SecretBridgeUi {
     fn dismiss(ctx: &egui::Context) {
         // Disable hit-testing before teardown. On macOS this maps to
         // NSWindow.setIgnoresMouseEvents(true), so the surface cannot intercept clicks while
-        // visibility and close commands propagate through the window server.
+        // the one-shot prompt process finishes.
         ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
             egui::WindowLevel::Normal,
         ));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
     }
 
     fn complete_request(&mut self, ctx: &egui::Context) {
@@ -442,13 +414,10 @@ impl SecretBridgeUi {
         let Some(mode) = self.mode.take() else {
             return;
         };
-        let Some(reply) = self.reply.take() else {
-            return;
-        };
+        let secure_input = self._secure_input.take();
         Self::dismiss(ctx);
         match (mode, outcome) {
             (Mode::Secret { secret_id, .. }, UiResult::Secret(secret)) => {
-                let error_reply = reply.clone();
                 let spawn_result = thread::Builder::new()
                     .name("secret-bridge-credential-store".into())
                     .spawn(move || {
@@ -462,30 +431,40 @@ impl SecretBridgeUi {
                                     "could not store the secret in the operating-system credential store"
                                         .to_string()
                                 })?;
-                                Ok(true)
+                                Ok(())
                             });
-                        let _ = reply.send(UiReply::Secret(result));
+                        drop(secret);
+                        drop(secure_input);
+                        std::process::exit(if result.is_ok() {
+                            0
+                        } else {
+                            PROMPT_FAILED_EXIT_CODE
+                        });
                     });
-                if let Err(error) = spawn_result {
-                    let _ = error_reply.send(UiReply::Secret(Err(format!(
-                        "could not start the credential storage worker: {error}"
-                    ))));
+                if spawn_result.is_err() {
+                    std::process::exit(PROMPT_FAILED_EXIT_CODE);
                 }
             }
             (Mode::Secret { .. }, UiResult::Cancelled) => {
-                let _ = reply.send(UiReply::Secret(Ok(false)));
+                self.secret.zeroize();
+                drop(secure_input);
+                std::process::exit(PROMPT_CANCELLED_EXIT_CODE.into());
             }
             (Mode::Confirm { .. }, UiResult::Approved) => {
-                let _ = reply.send(UiReply::Confirm(true));
+                drop(secure_input);
+                std::process::exit(0);
             }
             (Mode::Confirm { .. }, UiResult::Cancelled) => {
-                let _ = reply.send(UiReply::Confirm(false));
+                drop(secure_input);
+                std::process::exit(PROMPT_CANCELLED_EXIT_CODE.into());
             }
             (Mode::Secret { .. }, UiResult::Approved) => {
-                let _ = reply.send(UiReply::Secret(Err("invalid UI result state".into())));
+                drop(secure_input);
+                std::process::exit(PROMPT_FAILED_EXIT_CODE);
             }
             (Mode::Confirm { .. }, UiResult::Secret(_)) => {
-                let _ = reply.send(UiReply::Confirm(false));
+                drop(secure_input);
+                std::process::exit(PROMPT_FAILED_EXIT_CODE);
             }
         }
         self.secret.zeroize();
@@ -503,7 +482,9 @@ impl eframe::App for SecretBridgeUi {
         let ctx = ui.ctx().clone();
         ctx.request_repaint_after(Duration::from_millis(50));
         if self.mode.is_none() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            // A secret-storage worker now owns the one-shot process lifetime. Keep the event
+            // loop alive but the window hidden and click-through until that worker exits with
+            // the operation result.
             return;
         }
         let mut visuals = egui::Visuals::dark();
@@ -563,17 +544,6 @@ impl eframe::App for SecretBridgeUi {
 impl Drop for SecretBridgeUi {
     fn drop(&mut self) {
         self.secret.zeroize();
-        if let Some(reply) = self.reply.take() {
-            match self.mode.take() {
-                Some(Mode::Secret { .. }) => {
-                    let _ = reply.send(UiReply::Secret(Err("SecretBridge UI closed".into())));
-                }
-                Some(Mode::Confirm { .. }) => {
-                    let _ = reply.send(UiReply::Confirm(false));
-                }
-                None => {}
-            }
-        }
     }
 }
 
@@ -632,46 +602,74 @@ pub(crate) fn prompt_and_store_secret(
     if env_var.is_some_and(|name| !valid_env_name(name)) {
         return Err("invalid environment variable name".into());
     }
-    let sender = UI_REQUESTS
-        .get()
-        .ok_or_else(|| "native UI broker is not running".to_string())?;
-    let (reply, response) = mpsc::sync_channel(0);
-    sender
-        .send(UiRequest::Secret {
-            secret_id: secret_id.to_string(),
-            client: client.to_string(),
-            label: label.to_string(),
-            description: description.to_string(),
-            env_var: env_var.map(str::to_string),
-            replacing,
-            reply,
-        })
-        .map_err(|_| "native UI broker stopped".to_string())?;
-    match response.recv().map_err(|_| "native UI broker stopped")? {
-        UiReply::Secret(result) => result,
-        UiReply::Confirm(_) => Err("native UI returned the wrong response type".into()),
-    }
+    run_prompt_process(Mode::Secret {
+        secret_id: secret_id.to_string(),
+        client: client.to_string(),
+        label: label.to_string(),
+        description: description.to_string(),
+        env_var: env_var.map(str::to_string),
+        replacing,
+    })
 }
 
 pub(crate) fn confirm(client: &str, title: &str, message: &str) -> Result<bool, String> {
     validate_ui_text("client", client, 1, 80, false)?;
     validate_ui_text("title", title, 1, 80, false)?;
     validate_ui_text("message", message, 1, 12_000, true)?;
-    let sender = UI_REQUESTS
-        .get()
-        .ok_or_else(|| "native UI broker is not running".to_string())?;
-    let (reply, response) = mpsc::sync_channel(0);
-    sender
-        .send(UiRequest::Confirm {
-            client: client.to_string(),
-            title: title.to_string(),
-            message: message.to_string(),
-            reply,
-        })
-        .map_err(|_| "native UI broker stopped".to_string())?;
-    match response.recv().map_err(|_| "native UI broker stopped")? {
-        UiReply::Confirm(approved) => Ok(approved),
-        UiReply::Secret(_) => Err("native UI returned the wrong response type".into()),
+    run_prompt_process(Mode::Confirm {
+        client: client.to_string(),
+        title: title.to_string(),
+        message: message.to_string(),
+    })
+}
+
+fn run_prompt_process(mode: Mode) -> Result<bool, String> {
+    let executable = std::env::current_exe()
+        .and_then(|path| path.canonicalize())
+        .map_err(|error| format!("cannot resolve the SecretBridge executable: {error}"))?;
+    let mut command = Command::new(executable);
+    command
+        .arg("--native-prompt")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+
+        // The MCP broker is a console binary. Suppress a transient console window for the
+        // one-shot child while still allowing its native SecretBridge window to appear.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("cannot start the native prompt: {error}"))?;
+
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or_else(|| "native prompt input is unavailable".to_string())
+        .and_then(|mut input| {
+            serde_json::to_writer(&mut input, &mode)
+                .map_err(|error| format!("cannot encode native prompt request: {error}"))?;
+            input
+                .flush()
+                .map_err(|error| format!("cannot send native prompt request: {error}"))
+        });
+    let status = child
+        .wait()
+        .map_err(|error| format!("cannot wait for the native prompt: {error}"))?;
+    write_result?;
+
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(code) if code == i32::from(PROMPT_CANCELLED_EXIT_CODE) => Ok(false),
+        Some(PROMPT_FAILED_EXIT_CODE) => {
+            Err("the native prompt could not complete the requested operation".into())
+        }
+        Some(_) => Err("the native prompt exited unexpectedly".into()),
+        None => Err("the native prompt was terminated unexpectedly".into()),
     }
 }
 
@@ -687,87 +685,60 @@ fn ensure_entry_is_empty(entry: &keyring::Entry) -> Result<(), String> {
 }
 
 pub fn run_desktop(config: AppConfig) -> Result<(), String> {
-    let (sender, receiver) = mpsc::channel();
-    UI_REQUESTS
-        .set(sender.clone())
-        .map_err(|_| "native UI broker was initialized twice".to_string())?;
-    let protocol_result = Arc::new(Mutex::new(None));
-    let worker_result = Arc::clone(&protocol_result);
-    thread::Builder::new()
-        .name("secret-bridge-protocol".into())
-        .spawn(move || {
-            let result = protocol::run_stdio(config);
-            if let Ok(mut slot) = worker_result.lock() {
-                *slot = Some(result);
-            }
-            let _ = sender.send(UiRequest::Shutdown);
-        })
-        .map_err(|error| format!("cannot start protocol worker: {error}"))?;
+    protocol::run_stdio(config)
+}
 
-    loop {
-        let request = receiver
-            .recv()
-            .map_err(|_| "native UI request channel stopped".to_string())?;
-        match request {
-            UiRequest::Secret {
-                secret_id,
-                client,
-                label,
-                description,
-                env_var,
-                replacing,
-                reply,
-            } => {
-                let guard = match SecureInputGuard::try_new() {
-                    Ok(guard) => guard,
-                    Err(error) => {
-                        let _ = reply.send(UiReply::Secret(Err(error)));
-                        continue;
-                    }
-                };
-                run_request_window(
-                    Mode::Secret {
-                        secret_id,
-                        client,
-                        label,
-                        description,
-                        env_var,
-                        replacing,
-                    },
-                    reply,
-                    Some(guard),
-                    WINDOW_HEIGHT_SECRET,
-                )?;
-            }
-            UiRequest::Confirm {
-                client,
-                title,
-                message,
-                reply,
-            } => run_request_window(
-                Mode::Confirm {
-                    client,
-                    title,
-                    message,
-                },
-                reply,
-                None,
-                WINDOW_HEIGHT_CONFIRM,
-            )?,
-            UiRequest::Shutdown => break,
-        }
-    }
-
-    protocol_result
+pub fn run_native_prompt_child() -> Result<u8, String> {
+    let mut encoded = Vec::new();
+    std::io::stdin()
         .lock()
-        .map_err(|_| "protocol result channel failed".to_string())?
-        .take()
-        .ok_or_else(|| "SecretBridge UI stopped before the protocol worker".to_string())?
+        .take(MAX_PROMPT_REQUEST_BYTES + 1)
+        .read_to_end(&mut encoded)
+        .map_err(|error| format!("cannot read native prompt request: {error}"))?;
+    if encoded.len() as u64 > MAX_PROMPT_REQUEST_BYTES {
+        return Err("native prompt request is too large".into());
+    }
+    let mode: Mode = serde_json::from_slice(&encoded)
+        .map_err(|error| format!("invalid native prompt request: {error}"))?;
+
+    let (secure_input, height) = match &mode {
+        Mode::Secret {
+            secret_id,
+            client,
+            label,
+            description,
+            env_var,
+            ..
+        } => {
+            if !valid_secret_id(secret_id) {
+                return Err("invalid provisional secret ID".into());
+            }
+            validate_ui_text("client", client, 1, 80, false)?;
+            validate_ui_text("label", label, 3, 120, false)?;
+            validate_ui_text("description", description, 3, 500, true)?;
+            if env_var.as_deref().is_some_and(|name| !valid_env_name(name)) {
+                return Err("invalid environment variable name".into());
+            }
+            (Some(SecureInputGuard::try_new()?), WINDOW_HEIGHT_SECRET)
+        }
+        Mode::Confirm {
+            client,
+            title,
+            message,
+        } => {
+            validate_ui_text("client", client, 1, 80, false)?;
+            validate_ui_text("title", title, 1, 80, false)?;
+            validate_ui_text("message", message, 1, 12_000, true)?;
+            (None, WINDOW_HEIGHT_CONFIRM)
+        }
+    };
+
+    run_request_window(mode, secure_input, height)?;
+    Ok(PROMPT_CANCELLED_EXIT_CODE)
 }
 
 fn run_request_window(
     mode: Mode,
-    reply: SyncSender<UiReply>,
     secure_input: Option<SecureInputGuard>,
     height: f32,
 ) -> Result<(), String> {
@@ -806,7 +777,6 @@ fn run_request_window(
         Box::new(move |_creation_context| {
             Ok(Box::new(SecretBridgeUi::new(
                 mode,
-                reply,
                 secure_input,
                 window_size,
             )))
@@ -864,7 +834,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dismissal_disables_hit_testing_before_closing_the_window() {
+    fn prompt_ipc_contains_metadata_but_has_no_secret_value_field() {
+        let mode = Mode::Secret {
+            secret_id: "sb_0123456789abcdef0123456789abcdef".into(),
+            client: "Test client".into(),
+            label: "Test credential".into(),
+            description: "Used only for serialization validation".into(),
+            env_var: Some("TEST_CREDENTIAL".into()),
+            replacing: false,
+        };
+        let encoded = serde_json::to_value(mode).expect("serialize prompt metadata");
+        let object = encoded.as_object().expect("prompt request object");
+
+        assert_eq!(
+            object.get("kind").and_then(serde_json::Value::as_str),
+            Some("secret")
+        );
+        assert!(!object.contains_key("secret"));
+        assert!(!object.contains_key("value"));
+        assert!(!object.contains_key("password"));
+    }
+
+    #[test]
+    fn dismissal_disables_hit_testing_before_hiding_the_child_window() {
         let context = egui::Context::default();
         let output = context.run_ui(egui::RawInput::default(), |ui| {
             SecretBridgeUi::dismiss(ui.ctx());
@@ -882,14 +874,13 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing viewport command: {expected:?}"))
         };
         let passthrough = command_index(&egui::ViewportCommand::MousePassthrough(true));
-        let hidden = command_index(&egui::ViewportCommand::Visible(false));
         let normal_level = command_index(&egui::ViewportCommand::WindowLevel(
             egui::WindowLevel::Normal,
         ));
-        let closed = command_index(&egui::ViewportCommand::Close);
+        let hidden = command_index(&egui::ViewportCommand::Visible(false));
 
-        assert!(passthrough < hidden);
-        assert!(hidden < normal_level);
-        assert!(normal_level < closed);
+        assert!(passthrough < normal_level);
+        assert!(normal_level < hidden);
+        assert!(!commands.contains(&egui::ViewportCommand::Close));
     }
 }

@@ -2,6 +2,14 @@
 
 All notable changes to SecretBridge are documented here.
 
+## 0.1.4 - 2026-09-04
+
+- Moved each native prompt into a one-shot child process of the installed SecretBridge executable.
+- The prompt process now terminates after approval, cancellation, or credential storage, making native-window destruction an operating-system guarantee rather than an eframe close handshake.
+- The persistent MCP broker never creates a native window; prompt metadata enters the child over stdin, while secret values remain inside the child and are written directly to the OS credential store.
+- Added click-through and hide-before-exit teardown so a slow credential-store operation cannot block desktop input.
+- Reproduced the blank 520x540 macOS blocker and verified both secret-entry and confirmation flows leave zero WindowServer surfaces after completion.
+
 ## 0.1.3 - 2026-09-03
 
 - Removed the persistent hidden native window from idle MCP broker processes.

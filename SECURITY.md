@@ -6,7 +6,7 @@ Security fixes are provided for the latest tagged release. Upgrade before report
 
 ## Goal
 
-SecretBridge is designed to prevent the common failure mode where a person pastes a credential into an AI conversation, terminal transcript, tool argument, or MCP result. The already-running broker opens the secret UI and stores directly into the OS credential facility without spawning another executable or serializing the value.
+SecretBridge is designed to prevent the common failure mode where a person pastes a credential into an AI conversation, terminal transcript, tool argument, or MCP result. The broker launches a one-shot prompt from its own executable. Only validated display metadata enters that process; the secret is entered and stored directly into the OS credential facility there and is never serialized back to the broker.
 
 SecretBridge trusts the local user account and operating system. It is not an endpoint-security or malware-detection product. Once a user approves writing a `.env` file, that file is intentionally ordinary local plaintext.
 
@@ -40,8 +40,8 @@ Not trusted:
 ## Controls
 
 - No API can reveal a raw value.
-- The popup never writes a value to stdout, an environment variable, a command argument, or an IPC channel. Its result stays inside the broker process.
-- Idle broker processes own no native windows. A prompt window is created on demand, made mouse-active only when shown, made click-through before teardown, and destroyed after completion or cancellation.
+- The popup never writes a value to stdout, an environment variable, a command argument, or an IPC channel. The one-shot child writes it directly to the OS credential store; the broker receives only the child's exit status.
+- Persistent broker processes own no native windows. A one-shot prompt process is created on demand, made mouse-active only when shown, made click-through before teardown, and terminated after completion or cancellation so the OS destroys every native surface it owns.
 - Every creation and replacement gets a fresh random credential ID. The broker refuses to overwrite an existing ID.
 - The server uses local stdio and opens no listening socket.
 - Native secret entry uses a masked password field.
