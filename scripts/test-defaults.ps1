@@ -22,7 +22,10 @@ function Invoke-TestSetup([string]$Client = "both", [bool]$ExpectFailure = $fals
     } finally { $ErrorActionPreference = $previousErrorActionPreference }
     if ($ExpectFailure) {
         if ($exitCode -eq 0) { throw "Setup unexpectedly succeeded." }
-        if (($result | Out-String) -notmatch "Malformed SecretBridge markers") {
+        # Do not format ErrorRecords through Out-String: Windows PowerShell
+        # wraps/truncates them to the host width, splitting expected text.
+        $failureText = ($result | ForEach-Object { $_.ToString() }) -join " "
+        if ($failureText -notmatch "Malformed\s+SecretBridge\s+markers") {
             throw "Setup failed for an unexpected reason: $result"
         }
     } elseif ($exitCode -ne 0) { throw "Setup failed: $result" }
