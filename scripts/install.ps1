@@ -27,3 +27,4 @@ try {
 }
 
 Write-Output "Installed SecretBridge at $destination"
+Write-Output "After registering the MCP, enable automatic credential routing: & '$PSScriptRoot\enable-defaults.ps1' both"

@@ -178,6 +178,28 @@ Add this to Gemini CLI's `settings.json` and keep `trust` set to `false` so the 
 
 The same stdio entry works with any local MCP host—including future Grok or other clients—when that host supports launching local stdio servers. A web-only chat cannot create a native popup on your computer without a local companion process.
 
+### Make SecretBridge the default for credentials
+
+After registering the MCP above, run this once from the repository checkout:
+
+```sh
+# macOS: enable for both Codex and Claude Code
+sh ./scripts/enable-defaults.sh both
+```
+
+```powershell
+# Windows: enable for both Codex and Claude Code
+.\scripts\enable-defaults.ps1 both
+```
+
+Use `codex` or `claude` instead of `both` to configure only one client. The scripts install the shared [credential instructions](docs/client-instructions.md) in the clients' user-level instruction files. They preserve existing preferences and update only their marked section when rerun. They respect `CODEX_HOME` and `CLAUDE_CONFIG_DIR`; Codex's nonempty `AGENTS.override.md` is selected when present.
+
+Start a new Codex task or Claude Code session afterward. When a task needs a credential, the AI is instructed to discover SecretBridge, check saved labels, reuse an appropriate credential or open the popup, and use `env_write` for an approved destination. You do not need to mention the MCP in each request. If the tools are unavailable, it helps resolve the connection instead of asking you to paste a key in chat.
+
+These are persistent defaults, not a guarantee of every model decision. They do not change tool permissions, bypass native approvals, or expand the configured workspace. A global MCP entry with a fixed `--workspace-root` still writes only within that root; configure an entry for another project before writing there. Claude Desktop chat does not automatically load Claude Code's `CLAUDE.md`.
+
+To undo the preference, remove just the section between the SecretBridge managed markers in the affected instruction file. MCP registration and saved credentials are separate and remain available. See [Codex instruction discovery](https://developers.openai.com/codex/guides/agents-md/) and [Claude Code memory](https://code.claude.com/docs/en/memory) for client behavior.
+
 ### Windows example
 
 JSON paths must escape backslashes:
@@ -200,7 +222,9 @@ JSON paths must escape backslashes:
 
 ## Example conversation
 
-> Configure Stripe for local development. Do not ask me to paste the key in chat; use SecretBridge and put it in `.env.local` as `STRIPE_SECRET_KEY`.
+> Configure Stripe for local development using `.env.local` and `STRIPE_SECRET_KEY`.
+
+With the default credential instructions installed, this is enough; you do not need to remind the AI about SecretBridge.
 
 The AI calls `secret_request`. You see a native dialog labeled, for example, “Stripe test secret key for Acme billing,” paste the value there, and click **Save securely**. The AI receives an ID such as `sb_…`, then calls `env_write`. A second popup shows the full destination and mapping before anything is written.
 

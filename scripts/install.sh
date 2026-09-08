@@ -19,3 +19,4 @@ mv -f "$staged" "$install_dir/secret-bridge-mcp"
 trap - EXIT HUP INT TERM
 
 echo "Installed SecretBridge at $install_dir/secret-bridge-mcp"
+echo "After registering the MCP, enable automatic credential routing: sh \"$script_dir/enable-defaults.sh\" both"

@@ -2,6 +2,10 @@
 
 All notable changes to SecretBridge are documented here.
 
+## Unreleased
+
+- Added a one-time setup for Codex and Claude Code to prefer SecretBridge whenever a credential is needed, with a shared instruction template and portable scripts that preserve existing user preferences.
+
 ## 0.1.5 - 2026-09-04
 
 - Made the secure-input guard an explicit RAII type on Windows as well as macOS, keeping teardown semantics consistent and satisfying the Windows CI lint gate.
