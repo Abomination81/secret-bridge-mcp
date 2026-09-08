@@ -74,3 +74,7 @@ try {
         if ([IO.Directory]::Exists($directory)) { [IO.Directory]::Delete($directory) }
     }
 }
+
+# Expected-failure subprocesses leave LASTEXITCODE=1. Report success only
+# after all assertions and cleanup have completed, including in CI wrappers.
+exit 0
