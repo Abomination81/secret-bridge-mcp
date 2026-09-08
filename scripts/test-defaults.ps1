@@ -11,10 +11,20 @@ $runner = (Get-Process -Id $PID).Path
 $setup = Join-Path $PSScriptRoot "enable-defaults.ps1"
 
 function Invoke-TestSetup([string]$Client = "both", [bool]$ExpectFailure = $false) {
-    $result = & $runner -NoProfile -NonInteractive -File $setup $Client -CodexDir $codexTestDir -ClaudeDir $claudeTestDir 2>&1
-    $exitCode = $LASTEXITCODE
+    # Windows PowerShell 5.1 promotes redirected native stderr to its error
+    # stream. Capture expected refusals without Stop aborting before the exit
+    # status can be checked, and restore strict failure handling afterward.
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $result = & $runner -NoProfile -NonInteractive -File $setup $Client -CodexDir $codexTestDir -ClaudeDir $claudeTestDir 2>&1
+        $exitCode = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $previousErrorActionPreference }
     if ($ExpectFailure) {
         if ($exitCode -eq 0) { throw "Setup unexpectedly succeeded." }
+        if (($result | Out-String) -notmatch "Malformed SecretBridge markers") {
+            throw "Setup failed for an unexpected reason: $result"
+        }
     } elseif ($exitCode -ne 0) { throw "Setup failed: $result" }
 }
 function Assert-Equal($Expected, $Actual, [string]$Description) {

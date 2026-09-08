@@ -38,6 +38,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/test-defaults.ps1
+      - name: Test client instruction setup on Windows PowerShell 5.1
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/test-defaults.ps1
       - run: rustup toolchain install 1.93.1 --profile minimal --component rustfmt,clippy
       - run: rustup default 1.93.1
       - run: rustup target add '${{ matrix.target }}'

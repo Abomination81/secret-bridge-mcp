@@ -112,7 +112,8 @@ try {
         Assert-RegularFile $update.Target
         if ([IO.File]::Exists($update.Target)) {
             # File.Replace preserves the destination's ACL on Windows.
-            [IO.File]::Replace($update.Stage, $update.Target, $null)
+            # $null binds to an empty string in PowerShell; pass a real .NET null.
+            [IO.File]::Replace($update.Stage, $update.Target, [System.Management.Automation.Language.NullString]::Value)
         } else { [IO.File]::Move($update.Stage, $update.Target) }
         Write-Output "Installed SecretBridge guidance in $($update.Target)"
     }
