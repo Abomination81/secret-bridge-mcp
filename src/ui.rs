@@ -5,6 +5,7 @@ pub fn prompt_and_store_secret(
     description: &str,
     env_var: Option<&str>,
     replacing: bool,
+    workspace: &str,
 ) -> Result<bool, String> {
     crate::native_ui::prompt_and_store_secret(
         provisional_secret_id,
@@ -13,6 +14,7 @@ pub fn prompt_and_store_secret(
         description,
         env_var,
         replacing,
+        workspace,
     )
 }
 

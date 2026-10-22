@@ -121,7 +121,7 @@ pub fn write_env_file(root: &Path, target: &Path, values: &[EnvValue]) -> Result
         .ok_or_else(|| "env target path must be UTF-8".to_string())?;
     let revalidated = resolve_env_path(root, requested)?;
     if revalidated != target {
-        return Err("env target changed while awaiting approval".into());
+        return Err("env target changed before writing".into());
     }
     refuse_tracked_target(root, relative)?;
     ensure_gitignore(root)?;

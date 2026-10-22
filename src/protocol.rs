@@ -180,7 +180,7 @@ fn initialize(request: &Value) -> Result<Value, String> {
             "title": "SecretBridge",
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Secret values never appear in MCP results. Use secret_request to obtain an opaque secret_id, then env_write to materialize it only after the user approves the exact local path and variable names. When secret_request returns safe_to_continue=true, tell the user SecretBridge confirmed secure receipt and proceed without asking whether the popup was submitted. Secret IDs are workspace-granted; request the same label to ask for a one-time grant in another workspace. Never ask the user to paste a secret into chat. Never attempt to read a generated .env file. Public-prefixed secret variables are refused."
+        "instructions": "Secret values never appear in MCP results. Use secret_request to obtain an opaque secret_id, then env_write to materialize it in the granted workspace. Submitting Save & Use authorizes env writes there without another prompt; verify the intended local path and variable names and continue without asking for permission again. When secret_request returns safe_to_continue=true, tell the user SecretBridge confirmed secure receipt and proceed without asking whether the popup was submitted. Secret IDs are workspace-granted; request the same label to ask for a one-time grant in another workspace. Never ask the user to paste a secret into chat. Never attempt to read a generated .env file. Public-prefixed secret variables are refused."
     }))
 }
 
@@ -255,7 +255,7 @@ fn secret_request(
                     record.clone()
                 } else {
                     let message = format!(
-                        "Allow this stored secret in another workspace?\n\nLabel: {}\nWorkspace: {}\n\nThis grants future env writes in this workspace, but every env write still requires approval.",
+                        "Allow this stored secret in another workspace?\n\nLabel: {}\nWorkspace: {}\n\nThis allows future .env writes in this workspace without another prompt. Those files are readable by local processes with filesystem access.",
                         record.label,
                         config.workspace_root.display()
                     );
@@ -293,6 +293,7 @@ fn secret_request(
         &description,
         suggested_env_var.as_deref(),
         existing.is_some(),
+        &workspace_id(config),
     );
     let stored = match stored {
         Ok(stored) => stored,
@@ -398,7 +399,7 @@ fn secret_completion_response(
         SecretCompletion::Reused => (
             "reused",
             format!(
-                "An existing stored secret is available. Continue with secret_id {}. No secret value was returned to the AI.",
+                "An existing stored secret is available. Continue with secret_id {}; env writes in its granted workspace need no additional approval. No secret value was returned to the AI.",
                 record.id
             ),
             false,
@@ -408,7 +409,7 @@ fn secret_completion_response(
         SecretCompletion::Stored => (
             "stored",
             format!(
-                "Secret entry confirmed: the user submitted a non-empty value in the secure popup, and SecretBridge stored it in the operating-system credential store. Continue with secret_id {}. The secret value was not returned to the AI.",
+                "Secret entry confirmed: the user submitted a non-empty value in the secure popup, and SecretBridge stored it in the operating-system credential store. Continue with secret_id {}. Submission also authorizes env writes in this workspace; do not ask for another approval. The secret value was not returned to the AI.",
                 record.id
             ),
             true,
@@ -418,7 +419,7 @@ fn secret_completion_response(
         SecretCompletion::Updated => (
             "updated",
             format!(
-                "Secret entry confirmed: the user submitted a non-empty replacement value in the secure popup, and SecretBridge updated it in the operating-system credential store. Continue with secret_id {}. The secret value was not returned to the AI.",
+                "Secret entry confirmed: the user submitted a non-empty replacement value in the secure popup, and SecretBridge updated it in the operating-system credential store. Continue with secret_id {}. Submission also authorizes env writes in this workspace; do not ask for another approval. The secret value was not returned to the AI.",
                 record.id
             ),
             true,
@@ -437,6 +438,8 @@ fn secret_completion_response(
             "secret_received": secret_received,
             "secret_stored": true,
             "safe_to_continue": true,
+            "workspace_use_authorized": true,
+            "env_write_requires_approval": false,
             "reused": reused,
             "audit_recorded": audit_recorded
         }),
@@ -478,6 +481,20 @@ struct EnvEntryArg {
 }
 
 fn env_write(config: &AppConfig, registry: &Registry, arguments: Value) -> Result<Value, String> {
+    env_write_with(config, registry, arguments, |id| {
+        keyring_entry(id)?
+            .get_password()
+            .map(Zeroizing::new)
+            .map_err(|_| format!("stored value is unavailable for secret_id {id}"))
+    })
+}
+
+fn env_write_with(
+    config: &AppConfig,
+    registry: &Registry,
+    arguments: Value,
+    mut read_credential: impl FnMut(&str) -> Result<Zeroizing<String>, String>,
+) -> Result<Value, String> {
     let args: EnvWriteArgs = serde_json::from_value(arguments)
         .map_err(|error| format!("invalid env_write arguments: {error}"))?;
     if args.entries.is_empty() || args.entries.len() > 50 {
@@ -511,28 +528,13 @@ fn env_write(config: &AppConfig, registry: &Registry, arguments: Value) -> Resul
         resolved.push((mapping.name, record));
     }
 
-    let mapping_summary = resolved
-        .iter()
-        .map(|(name, record)| format!("{name}  <-  {}", record.label))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let message = format!(
-        "Write secrets to:\n{}\n\n{}\n\nExisting unrelated variables will be preserved. The workspace .gitignore will be updated to ignore .env* files. The AI could read the resulting file if it has unrestricted filesystem access.",
-        target.display(),
-        mapping_summary
-    );
-    if !ui::confirm(&config.client_name, "Approve .env write", &message)? {
-        return Err("user denied env file creation".into());
-    }
-
+    // Save & Use (or a cross-workspace grant) already authorizes materialization here.
+    // Validate every mapping before retrieving any values; the writer revalidates the file.
     let mut values = Vec::with_capacity(resolved.len());
     for (name, record) in &resolved {
-        let value = keyring_entry(&record.id)?
-            .get_password()
-            .map_err(|_| format!("stored value is unavailable for secret_id {}", record.id))?;
         values.push(EnvValue {
             name: name.clone(),
-            value: Zeroizing::new(value),
+            value: read_credential(&record.id)?,
         });
     }
     write_env_file(&config.workspace_root, &target, &values)?;
@@ -662,7 +664,7 @@ fn tool_definitions() -> Vec<Value> {
         json!({
             "name": "secret_request",
             "title": "Request a secret securely",
-            "description": "Open a native password popup for a clearly labeled secret, store it in the OS credential store, and return an explicit receipt acknowledgement plus an opaque secret_id. When safe_to_continue is true, acknowledge secure receipt and continue. Reuses an existing matching label unless replace_existing is true. Never ask the user to put the value in chat.",
+            "description": "Open a native password popup for a clearly labeled secret, store it in the OS credential store, and return an explicit receipt acknowledgement plus an opaque secret_id. Save & Use authorizes env writes in the displayed workspace without another approval. When safe_to_continue is true, acknowledge secure receipt and continue. Reuses an existing matching label unless replace_existing is true. Never ask the user to put the value in chat.",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
@@ -686,7 +688,7 @@ fn tool_definitions() -> Vec<Value> {
         json!({
             "name": "env_write",
             "title": "Write approved secrets to an env file",
-            "description": "After a native approval dialog, retrieve secrets locally and merge them into a .env, .env.*, or .dev.vars file under the configured workspace. Values never pass through MCP. Also ensures .env* is gitignored.",
+            "description": "Retrieve workspace-authorized secrets locally and merge them into a .env, .env.*, or .dev.vars file under the configured workspace. Save & Use or a workspace grant already authorizes this; no second popup or permission question is needed. Values never pass through MCP. Also ensures .env* is gitignored.",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
@@ -768,6 +770,14 @@ mod tests {
         assert_eq!(result["structuredContent"]["secret_received"], true);
         assert_eq!(result["structuredContent"]["secret_stored"], true);
         assert_eq!(result["structuredContent"]["safe_to_continue"], true);
+        assert_eq!(
+            result["structuredContent"]["workspace_use_authorized"],
+            true
+        );
+        assert_eq!(
+            result["structuredContent"]["env_write_requires_approval"],
+            false
+        );
         let message = result["content"][0]["text"].as_str().unwrap();
         assert!(message.contains("Secret entry confirmed"));
         assert!(message.contains("Continue with secret_id sb_test_id"));
@@ -792,6 +802,120 @@ mod tests {
         assert_eq!(result["structuredContent"]["secret_received"], false);
         assert_eq!(result["structuredContent"]["secret_stored"], true);
         assert_eq!(result["structuredContent"]["safe_to_continue"], true);
+        assert_eq!(
+            result["structuredContent"]["workspace_use_authorized"],
+            true
+        );
+        assert_eq!(
+            result["structuredContent"]["env_write_requires_approval"],
+            false
+        );
+    }
+
+    #[test]
+    fn workspace_grant_allows_env_write_without_a_second_prompt() {
+        let workspace = tempdir().unwrap();
+        let data = tempdir().unwrap();
+        let data_path = data.path().join("private");
+        let config = AppConfig::for_test(workspace.path(), &data_path);
+        let registry = Registry::new(&data_path);
+        let record = registry
+            .insert_with_id(
+                "sb_0123456789abcdef0123456789abcdef".into(),
+                "Test credential".into(),
+                "Integration test only".into(),
+                Some("TEST_TOKEN".into()),
+                workspace_id(&config),
+            )
+            .unwrap();
+        let target = workspace.path().join(".env.local");
+        std::fs::write(&target, "KEEP=yes\n").unwrap();
+        let result = env_write_with(
+            &config,
+            &registry,
+            json!({
+                "path": ".env.local",
+                "entries": [{"name": "TEST_TOKEN", "secret_id": record.id}]
+            }),
+            |id| {
+                assert_eq!(id, record.id);
+                Ok(Zeroizing::new("dummy-regression-value".into()))
+            },
+        )
+        .unwrap();
+        assert_eq!(result["structuredContent"]["status"], "written");
+        assert_eq!(
+            std::fs::read_to_string(target).unwrap(),
+            "KEEP=yes\nTEST_TOKEN=\"dummy-regression-value\"\n"
+        );
+        assert!(!result.to_string().contains("dummy-regression-value"));
+        let audit = std::fs::read_to_string(data_path.join("audit.jsonl")).unwrap();
+        assert!(!audit.contains("dummy-regression-value"));
+        assert!(audit.contains("env_written"));
+    }
+
+    #[test]
+    fn automatic_env_write_rejects_unauthorized_workspace_and_unsafe_mappings() {
+        let workspace = tempdir().unwrap();
+        let other = tempdir().unwrap();
+        let data = tempdir().unwrap();
+        let data_path = data.path().join("private");
+        let config = AppConfig::for_test(workspace.path(), &data_path);
+        let registry = Registry::new(&data_path);
+        let id = "sb_0123456789abcdef0123456789abcdef";
+        registry
+            .insert_with_id(
+                id.into(),
+                "Test credential".into(),
+                "Integration test only".into(),
+                None,
+                other.path().to_string_lossy().into_owned(),
+            )
+            .unwrap();
+        let args = json!({"path": ".env", "entries": [{"name": "TOKEN", "secret_id": id}]});
+        let error = env_write_with(&config, &registry, args, |_| {
+            panic!("must not read a credential before workspace authorization")
+        })
+        .unwrap_err();
+        assert!(error.contains("not authorized for this workspace"));
+        assert!(!workspace.path().join(".env").exists());
+
+        registry
+            .grant_workspace(id, &workspace_id(&config))
+            .unwrap();
+        for (path, name) in [
+            ("../.env", "TOKEN"),
+            (".env.example", "TOKEN"),
+            (".env", "NEXT_PUBLIC_TOKEN"),
+        ] {
+            assert!(
+                env_write_with(
+                    &config,
+                    &registry,
+                    json!({
+                        "path": path, "entries": [{"name": name, "secret_id": id}]
+                    }),
+                    |_| panic!("unsafe mapping must be rejected before retrieval")
+                )
+                .is_err()
+            );
+        }
+        // A bad second mapping must prevent retrieval of the otherwise valid first one.
+        assert!(
+            env_write_with(
+                &config,
+                &registry,
+                json!({
+                    "path": ".env", "entries": [
+                        {"name": "TOKEN", "secret_id": id},
+                        {"name": "VITE_TOKEN", "secret_id": id}
+                    ]
+                }),
+                |_| panic!("validate the entire batch first")
+            )
+            .is_err()
+        );
+        assert!(!workspace.path().join(".env").exists());
     }
 
     #[test]

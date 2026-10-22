@@ -2,7 +2,14 @@
 
 All notable changes to SecretBridge are documented here.
 
-## Unreleased
+## 0.2.0 - 2026-10-22
+
+- Replaced the neon macOS popup with AppKit: system controls and typography, a lock symbol, a secure native field, and Finder-style workspace breadcrumbs. Windows uses a simplified light layout.
+- Made the macOS dialog draggable by its background and bounded long request details in a scroll area so the field and buttons remain visible. Added a dedicated drag surface to the Windows layout.
+- Added standard macOS editing commands, including ⌘V, Return to submit, and Escape to cancel. Initial focus no longer steals focus back from other controls.
+- Kept entry dialogs compatible with older running brokers during an in-place update; reconnecting activates the new consent behavior.
+- Save & Use now authorizes storage and env writes in the displayed workspace without a second approval. Existing workspace grants follow the same behavior. Cross-workspace grants, deletion confirmations, and all destination checks remain in place.
+- Updated MCP receipts and client instructions to make the authorization explicit.
 
 - Added a one-time setup for Codex and Claude Code to prefer SecretBridge whenever a credential is needed, with a shared instruction template and portable scripts that preserve existing user preferences.
 
