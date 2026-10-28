@@ -63,10 +63,69 @@ fn label(
     label.setFrame(frame);
     label.setPreferredMaxLayoutWidth(frame.size.width);
     label.setFont(Some(&NSFont::systemFontOfSize(size)));
+    label.setMaximumNumberOfLines(0);
+    if let Some(cell) = label.cell() {
+        cell.setUsesSingleLineMode(false);
+        cell.setScrollable(false);
+        cell.setWraps(true);
+        cell.setLineBreakMode(NSLineBreakMode::ByWordWrapping);
+        cell.setTruncatesLastVisibleLine(false);
+    }
     if secondary {
         label.setTextColor(Some(&NSColor::secondaryLabelColor()));
     }
     label
+}
+
+fn fit_label(label: &NSTextField, width: f64) -> f64 {
+    label.setPreferredMaxLayoutWidth(width);
+    // Measure the wrapped cell at its actual drawing width, including explicit line breaks.
+    // fittingSize alone describes Auto Layout's preferred size, not this manual text layout.
+    let height = label
+        .cell()
+        .map(|cell| {
+            cell.cellSizeForBounds(rect(0.0, 0.0, width, 1_000_000.0))
+                .height
+        })
+        .unwrap_or_else(|| label.fittingSize().height)
+        .ceil()
+        + 2.0;
+    label.setFrameSize(NSSize::new(width, height));
+    height
+}
+
+fn message_view(
+    mtm: MainThreadMarker,
+    text: &str,
+    width: f64,
+    max_height: f64,
+    secondary: bool,
+) -> Retained<NSScrollView> {
+    let details = label(mtm, text, rect(0.0, 0.0, width, 1.0), 13.0, secondary);
+    let natural_height = fit_label(&details, width);
+    let overflow = natural_height > max_height;
+    let scroll = NSScrollView::initWithFrame(
+        NSScrollView::alloc(mtm),
+        rect(0.0, 0.0, width, natural_height.min(max_height)),
+    );
+    scroll.setBorderType(NSBorderType::NoBorder);
+    scroll.setDrawsBackground(false);
+    scroll.setHasHorizontalScroller(false);
+    // A persistent scrollbar makes overflow discoverable even with macOS auto-hide enabled.
+    scroll.setScrollerStyle(NSScrollerStyle::Legacy);
+    scroll.setAutohidesScrollers(false);
+    scroll.setHasVerticalScroller(overflow);
+    fit_label(&details, scroll.contentSize().width);
+    scroll.setDocumentView(Some(&details));
+    let clip = scroll.contentView();
+    let top = if details.isFlipped() {
+        0.0
+    } else {
+        (details.frame().size.height - scroll.contentSize().height).max(0.0)
+    };
+    clip.scrollToPoint(NSPoint::new(0.0, top));
+    scroll.reflectScrolledClipView(&clip);
+    scroll
 }
 
 fn install_edit_menu(mtm: MainThreadMarker, app: &NSApplication) {
@@ -164,25 +223,36 @@ pub(super) fn run(mode: Mode, secure_input: Option<SecureInputGuard>) -> Result<
                 "Save a credential"
             }));
             alert.setInformativeText(&NSString::from_str(title));
-            let accessory = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, 320.0, 210.0));
-            // Keep arbitrary request details in a bounded scroll view; controls remain outside it.
-            let details = label(mtm, description, rect(0.0, 0.0, 320.0, 140.0), 13.0, true);
-            let scroll = NSScrollView::initWithFrame(
-                NSScrollView::alloc(mtm),
-                rect(0.0, 168.0, 320.0, 40.0),
+            let note = label(
+                mtm,
+                &if legacy {
+                    "Saved in Keychain. Never sent to chat.".into()
+                } else {
+                    format!("Saved in Keychain. Available to {client} here.")
+                },
+                rect(0.0, 0.0, 320.0, 1.0),
+                11.0,
+                true,
             );
-            scroll.setBorderType(NSBorderType::NoBorder);
-            scroll.setDrawsBackground(false);
-            scroll.setHasVerticalScroller(true);
-            scroll.setAutohidesScrollers(true);
-            scroll.setDocumentView(Some(&details));
-            // NSTextField's natural height avoids scrolling short descriptions.
-            details.setFrameSize(NSSize::new(320.0, details.fittingSize().height.max(36.0)));
+            note.setAlignment(NSTextAlignment::Center);
+            let note_height = fit_label(&note, 320.0);
+            let scope_y = note_height + 12.0;
+            let input_y = scope_y + 64.0 + 16.0;
+            let details_y = input_y + 32.0 + 16.0;
+            let max_height = NSScreen::mainScreen(mtm).map_or(220.0, |screen| {
+                (screen.visibleFrame().size.height - 420.0).clamp(80.0, 220.0)
+            });
+            let scroll = message_view(mtm, description, 320.0, max_height, true);
+            scroll.setFrameOrigin(NSPoint::new(0.0, details_y));
+            let accessory = NSView::initWithFrame(
+                NSView::alloc(mtm),
+                rect(0.0, 0.0, 320.0, details_y + scroll.frame().size.height),
+            );
             accessory.addSubview(&scroll);
 
             let input = NSSecureTextField::initWithFrame(
                 NSSecureTextField::alloc(mtm),
-                rect(0.0, 120.0, 320.0, 32.0),
+                rect(0.0, input_y, 320.0, 32.0),
             );
             input.setFont(Some(&NSFont::systemFontOfSize(15.0)));
             input.setPlaceholderString(Some(ns_string!("API key or password")));
@@ -192,7 +262,7 @@ pub(super) fn run(mode: Mode, secure_input: Option<SecureInputGuard>) -> Result<
             }
             accessory.addSubview(&input);
 
-            let scope = NSBox::initWithFrame(NSBox::alloc(mtm), rect(0.0, 40.0, 320.0, 64.0));
+            let scope = NSBox::initWithFrame(NSBox::alloc(mtm), rect(0.0, scope_y, 320.0, 64.0));
             scope.setBoxType(NSBoxType::Custom);
             scope.setBorderWidth(0.0);
             scope.setTitlePosition(NSTitlePosition::NoTitle);
@@ -217,18 +287,6 @@ pub(super) fn run(mode: Mode, secure_input: Option<SecureInputGuard>) -> Result<
                 content.addSubview(&path);
             }
             accessory.addSubview(&scope);
-            let note = label(
-                mtm,
-                &if legacy {
-                    "Saved in Keychain. Never sent to chat.".into()
-                } else {
-                    format!("Saved in Keychain. Available to {client} here.")
-                },
-                rect(0.0, 1.0, 320.0, 29.0),
-                11.0,
-                true,
-            );
-            note.setAlignment(NSTextAlignment::Center);
             note.setToolTip(Some(ns_string!("Save & Use authorizes .env writes in this workspace without another prompt. Client names are supplied by the requesting process and are not verified. The credential is never sent to chat; local processes can read exported files.")));
             accessory.addSubview(&note);
             alert.setAccessoryView(Some(&accessory));
@@ -252,15 +310,10 @@ pub(super) fn run(mode: Mode, secure_input: Option<SecureInputGuard>) -> Result<
         } => {
             alert.setMessageText(&NSString::from_str(title));
             alert.setInformativeText(&NSString::from_str(&format!("Requested by {client}")));
-            let details = label(mtm, message, rect(0.0, 0.0, 340.0, 200.0), 13.0, false);
-            details.setFrameSize(NSSize::new(340.0, details.fittingSize().height.max(200.0)));
-            let scroll =
-                NSScrollView::initWithFrame(NSScrollView::alloc(mtm), rect(0.0, 0.0, 340.0, 200.0));
-            scroll.setBorderType(NSBorderType::NoBorder);
-            scroll.setDrawsBackground(false);
-            scroll.setHasVerticalScroller(true);
-            scroll.setAutohidesScrollers(true);
-            scroll.setDocumentView(Some(&details));
+            let max_height = NSScreen::mainScreen(mtm).map_or(260.0, |screen| {
+                (screen.visibleFrame().size.height - 340.0).clamp(80.0, 260.0)
+            });
+            let scroll = message_view(mtm, message, 340.0, max_height, false);
             alert.setAccessoryView(Some(&scroll));
             // Do not let Return approve deletion or a new workspace by accident.
             submit.setKeyEquivalent(ns_string!(""));

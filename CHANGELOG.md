@@ -2,6 +2,12 @@
 
 All notable changes to SecretBridge are documented here.
 
+## 0.2.1 - 2026-10-28
+
+- Let macOS credential popups grow to fit the request message instead of clipping it into a two-line area.
+- Measure wrapped text at its actual width, including line breaks and long client names, so message endings and footer text remain readable.
+- Show a persistent scrollbar when a request or confirmation is too long to fit on screen, start at the top, and keep the input and buttons visible.
+
 ## 0.2.0 - 2026-10-22
 
 - Replaced the neon macOS popup with AppKit: system controls and typography, a lock symbol, a secure native field, and Finder-style workspace breadcrumbs. Windows uses a simplified light layout.
