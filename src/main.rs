@@ -10,10 +10,11 @@ fn print_help() {
         "secret-bridge-mcp {version}\n\
          \n\
          Usage:\n\
-           secret-bridge-mcp [--workspace-root PATH] [--client-name NAME] [--data-dir PATH]\n\
+           secret-bridge-mcp [--workspace-per-request | --workspace-root PATH] [--client-name NAME] [--data-dir PATH]\n\
          \n\
          Options:\n\
            --workspace-root PATH  Restrict .env writes to this directory (default: cwd)\n\
+           --workspace-per-request  Require the current project's workspace_root on every tool call\n\
            --client-name NAME     Name shown in local approval dialogs (default: MCP client)\n\
            --data-dir PATH        Override the non-secret metadata directory\n\
            -V, --version          Show the version\n\
@@ -24,12 +25,14 @@ fn print_help() {
 
 fn parse_args() -> Result<AppConfig, String> {
     let mut workspace_root: Option<PathBuf> = None;
+    let mut workspace_per_request = false;
     let mut data_dir: Option<PathBuf> = None;
     let mut client_name = String::from("MCP client");
     let mut args = env::args_os().skip(1);
 
     while let Some(arg) = args.next() {
         match arg.to_string_lossy().as_ref() {
+            "--workspace-per-request" => workspace_per_request = true,
             "--workspace-root" => {
                 let value = args
                     .next()
@@ -60,7 +63,12 @@ fn parse_args() -> Result<AppConfig, String> {
         }
     }
 
-    AppConfig::new_with_data_dir(workspace_root, client_name, data_dir)
+    if workspace_per_request && workspace_root.is_some() {
+        return Err("--workspace-per-request cannot be combined with --workspace-root".into());
+    }
+    let mut config = AppConfig::new_with_data_dir(workspace_root, client_name, data_dir)?;
+    config.workspace_per_request = workspace_per_request;
+    Ok(config)
 }
 
 fn main() -> ExitCode {

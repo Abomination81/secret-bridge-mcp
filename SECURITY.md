@@ -49,12 +49,14 @@ Not trusted:
 - Values are stored by the OS credential facility under service `dev.secretbridge.mcp`.
 - In-memory secret strings use best-effort zeroization after use.
 - Metadata and audit records contain no values and use user-only permissions on macOS.
-- Env paths are relative, revalidated immediately before writing, confined to one canonical workspace, and limited to non-template dotenv filenames.
+- Env paths are relative, revalidated immediately before writing, confined to the request’s canonical workspace, and limited to non-template dotenv filenames.
 - Existing/parent symlinks and a symlinked `.gitignore` are rejected.
 - Git-tracked targets are refused and Git ignore status is verified before writing.
 - Existing env files and inbound JSON-RPC messages have size caps.
 - Secret variables with public client-bundle prefixes are rejected.
 - Labels reject line breaks, control characters, and Unicode bidirectional overrides.
+- Shared servers use `--workspace-per-request`: an absolute existing `workspace_root` is required on every call. Scope is validated before any credential access and never taken from a previous call. Fixed-root servers reject a supplied workspace that differs from their configured root.
+- A request workspace is routing context, not an authorization grant. Credential-specific workspace grants remain required for every export; choosing a path does not grant access to stored secrets.
 - Cross-workspace reuse requires a one-time native grant.
 - Save & Use authorizes credential storage and subsequent env writes within the displayed workspace. Existing workspace grants have the same meaning starting in 0.2; there is no per-write approval popup.
 - Cross-workspace grants and deletions retain a native confirmation. Closing or cancelling a dialog never grants access.

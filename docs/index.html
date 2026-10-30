@@ -125,12 +125,12 @@
       <div class="client-grid">
         <article><h3>Codex</h3><pre><code>codex mcp add secret-bridge -- \
   /absolute/path/secret-bridge-mcp \
-  --workspace-root /path/to/project \
+  --workspace-per-request \
   --client-name Codex</code></pre></article>
         <article><h3>Claude Code</h3><pre><code>claude mcp add --scope user \
   --transport stdio secret-bridge -- \
   /absolute/path/secret-bridge-mcp \
-  --workspace-root /path/to/project \
+  --workspace-per-request \
   --client-name "Claude Code"</code></pre></article>
       </div>
       <p class="compatibility">Make it automatic for Codex and Claude Code: after connecting, run <code>sh ./scripts/enable-defaults.sh both</code> on macOS or <code>.\scripts\enable-defaults.ps1 both</code> in Windows PowerShell from your checkout, then start a new session. This adds a persistent preference to use SecretBridge whenever a credential is needed. Existing tool permissions and popup approvals still apply.</p>

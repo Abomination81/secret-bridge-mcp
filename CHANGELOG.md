@@ -2,6 +2,13 @@
 
 All notable changes to SecretBridge are documented here.
 
+## 0.3.0 - 2026-10-30
+
+- Added `--workspace-per-request` for shared MCP installations. Every call carries its current project directory, so new chats cannot inherit a globally pinned previous project.
+- Reject missing, invalid, or mismatched workspace arguments before any prompt, credential retrieval, or write. Each request uses an immutable workspace snapshot; existing per-credential grants still apply.
+- Include the resolved workspace in secret receipts, metadata listings, and env-write receipts. Updated client defaults and configuration examples to prevent global MCP entries being repointed between chats.
+- Added regression coverage for interleaved workspaces, concurrent stdio sessions launched from another directory, and exports confined to the requesting project.
+
 ## 0.2.1 - 2026-10-28
 
 - Let macOS credential popups grow to fit the request message instead of clipping it into a two-line area.

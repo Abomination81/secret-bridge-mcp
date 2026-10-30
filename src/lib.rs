@@ -16,6 +16,7 @@ pub const SERVICE_NAME: &str = "dev.secretbridge.mcp";
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub workspace_root: PathBuf,
+    pub workspace_per_request: bool,
     pub data_dir: PathBuf,
     pub client_name: String,
 }
@@ -61,8 +62,39 @@ impl AppConfig {
 
         Ok(Self {
             workspace_root,
+            workspace_per_request: false,
             data_dir,
             client_name,
+        })
+    }
+
+    pub(crate) fn for_workspace_request(&self, requested: Option<&str>) -> Result<Self, String> {
+        let Some(requested) = requested else {
+            if self.workspace_per_request {
+                return Err("workspace_root is required on every call: use the current task's actual project directory, not a previous chat or the server's working directory".into());
+            }
+            return Ok(self.clone());
+        };
+        crate::validation::validate_display_text("workspace_root", requested, 1, 4096, false)?;
+        let requested = Path::new(requested);
+        if !requested.is_absolute() {
+            return Err("workspace_root must be an absolute path to the current project".into());
+        }
+        let workspace_root = requested
+            .canonicalize()
+            .map_err(|_| "workspace_root must name an existing directory")?;
+        if !workspace_root.is_dir() {
+            return Err("workspace_root must name an existing directory".into());
+        }
+        if !self.workspace_per_request && workspace_root != self.workspace_root {
+            return Err("workspace_root does not match this server's fixed workspace. Use a request-scoped SecretBridge server; do not repoint a shared server or export into a different project".into());
+        }
+        // A call owns this immutable snapshot. Never update a shared 'current workspace'.
+        Ok(Self {
+            workspace_root,
+            workspace_per_request: false,
+            data_dir: self.data_dir.clone(),
+            client_name: self.client_name.clone(),
         })
     }
 
@@ -70,6 +102,7 @@ impl AppConfig {
     pub(crate) fn for_test(workspace_root: &Path, data_dir: &Path) -> Self {
         Self {
             workspace_root: workspace_root.to_path_buf(),
+            workspace_per_request: false,
             data_dir: data_dir.to_path_buf(),
             client_name: "Test client".into(),
         }

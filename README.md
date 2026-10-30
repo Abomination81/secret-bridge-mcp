@@ -35,7 +35,7 @@ There is deliberately no `secret_get`, `secret_reveal`, clipboard, HTTP, or netw
 
 - `secret_request`: shows a hidden-input popup, stores a new value, or reuses an existing label. The result contains only an opaque `secret_id`.
 - `secret_list`: returns non-sensitive labels, purposes, IDs, and timestamps.
-- `env_write`: uses the existing workspace grant to merge selected secrets into `.env`, `.env.*`, or `.dev.vars` beneath one configured workspace, without a second popup.
+- `env_write`: uses the existing workspace grant to merge selected secrets into `.env`, `.env.*`, or `.dev.vars` beneath the workspace named in that request, without a second popup.
 - `secret_delete`: shows a confirmation and removes the stored credential and its metadata.
 
 After a new value is submitted and OS storage succeeds, `secret_request` explicitly returns:
@@ -55,7 +55,7 @@ The accompanying MCP message tells the AI that secure entry was confirmed and it
 
 `env_write` also:
 
-- rejects absolute paths, `..`, symlink targets/parents, and paths outside the configured workspace;
+- rejects absolute paths, `..`, symlink targets/parents, and paths outside the request workspace;
 - refuses committable templates such as `.env.example`, targets already tracked by Git, and targets Git does not report as ignored;
 - rejects client-bundled prefixes such as `NEXT_PUBLIC_`, `VITE_`, and `REACT_APP_`;
 - adds safe `.env*`/`.dev.vars` ignore rules and template exceptions to the workspace `.gitignore` when needed;
@@ -114,14 +114,18 @@ Convenience installers build the locked dependency graph from source and copy th
 
 No API key or secret is needed to build or run the MCP server itself. After replacing an installed binary, restart the MCP client so its persistent broker uses the new version. Older brokers can still open the updated entry dialog, but keep their old per-write approval behavior until restarted.
 
+**Upgrading to 0.3:** replace `--workspace-root` and its path with `--workspace-per-request` in shared MCP entries, then restart the client to refresh tool schemas. Existing credentials and workspace grants stay intact. A credential saved to the wrong workspace by an older setup can be reused by label in the intended workspace through its native grant; no value needs to be copied through chat.
+
 ## Configure an AI client
 
-Use an absolute binary path and an absolute workspace root. Configure one server entry per workspace so `.env` writes stay narrowly scoped.
+Use an absolute binary path. For an installation shared by multiple chats or projects, use **`--workspace-per-request`**. Every tool call must supply `workspace_root` with the current task's absolute project directory. The popup, grants, receipts, and env writes all use that request's directory; there is no remembered last project and no fallback when the argument is missing.
+
+A dedicated project-only server can still use `--workspace-root /absolute/path/to/project`. If a call supplies a different `workspace_root`, it is rejected. Without either flag, legacy installations use the launch directory. Do not use a fixed project path in a global entry that should serve unrelated projects.
 
 ### Codex and the ChatGPT desktop app
 
 ```sh
-codex mcp add secret-bridge -- /absolute/path/to/secret-bridge-mcp --workspace-root /absolute/path/to/project --client-name Codex
+codex mcp add secret-bridge -- /absolute/path/to/secret-bridge-mcp --workspace-per-request --client-name Codex
 ```
 
 Equivalent `~/.codex/config.toml`:
@@ -129,7 +133,7 @@ Equivalent `~/.codex/config.toml`:
 ```toml
 [mcp_servers.secret-bridge]
 command = "/absolute/path/to/secret-bridge-mcp"
-args = ["--workspace-root", "/absolute/path/to/project", "--client-name", "Codex"]
+args = ["--workspace-per-request", "--client-name", "Codex"]
 default_tools_approval_mode = "writes"
 ```
 
@@ -138,7 +142,7 @@ The ChatGPT desktop app, Codex CLI, and Codex IDE extension share this configura
 ### Claude Code
 
 ```sh
-claude mcp add --scope user --transport stdio secret-bridge -- /absolute/path/to/secret-bridge-mcp --workspace-root /absolute/path/to/project --client-name "Claude Code"
+claude mcp add --scope user --transport stdio secret-bridge -- /absolute/path/to/secret-bridge-mcp --workspace-per-request --client-name "Claude Code"
 ```
 
 ### Claude Desktop and other JSON-configured clients
@@ -149,8 +153,7 @@ claude mcp add --scope user --transport stdio secret-bridge -- /absolute/path/to
     "secret-bridge": {
       "command": "/absolute/path/to/secret-bridge-mcp",
       "args": [
-        "--workspace-root",
-        "/absolute/path/to/project",
+        "--workspace-per-request",
         "--client-name",
         "Claude Desktop"
       ]
@@ -169,8 +172,7 @@ Add this to Gemini CLI's `settings.json` and keep `trust` set to `false` so the 
     "secret-bridge": {
       "command": "/absolute/path/to/secret-bridge-mcp",
       "args": [
-        "--workspace-root",
-        "/absolute/path/to/project",
+        "--workspace-per-request",
         "--client-name",
         "Gemini CLI"
       ],
@@ -200,7 +202,7 @@ Use `codex` or `claude` instead of `both` to configure only one client. The scri
 
 Start a new Codex task or Claude Code session afterward. When a task needs a credential, the AI is instructed to discover SecretBridge, check saved labels, reuse an appropriate credential or open the popup, and use `env_write` within the authorized workspace without asking for permission again. You do not need to mention the MCP in each request. If the tools are unavailable, it helps resolve the connection instead of asking you to paste a key in chat.
 
-These are persistent defaults, not a guarantee of every model decision. They do not change tool permissions, bypass native approvals, or expand the configured workspace. A global MCP entry with a fixed `--workspace-root` still writes only within that root; configure an entry for another project before writing there. Claude Desktop chat does not automatically load Claude Code's `CLAUDE.md`.
+These are persistent defaults, not a guarantee of every model decision. They do not change tool permissions, bypass native approvals, or expand the configured workspace. Use `--workspace-per-request` for a global entry. Never repoint a global fixed root when switching tasks; existing chats can retain the old process and scope. Claude Desktop chat does not automatically load Claude Code's `CLAUDE.md`.
 
 To undo the preference, remove just the section between the SecretBridge managed markers in the affected instruction file. MCP registration and saved credentials are separate and remain available. See [Codex instruction discovery](https://developers.openai.com/codex/guides/agents-md/) and [Claude Code memory](https://code.claude.com/docs/en/memory) for client behavior.
 
@@ -214,8 +216,7 @@ JSON paths must escape backslashes:
     "secret-bridge": {
       "command": "C:\\Users\\you\\AppData\\Local\\SecretBridge\\secret-bridge-mcp.exe",
       "args": [
-        "--workspace-root",
-        "C:\\Users\\you\\src\\my-project",
+        "--workspace-per-request",
         "--client-name",
         "AI client"
       ]
@@ -230,7 +231,7 @@ JSON paths must escape backslashes:
 
 With the default credential instructions installed, this is enough; you do not need to remind the AI about SecretBridge.
 
-The AI calls `secret_request`. You see a native dialog labeled, for example, “Stripe test secret key for Acme billing,” paste the value there, and click **Save & Use**. The popup shows the workspace this authorizes. The AI receives an ID such as `sb_…`, then calls `env_write` there without a second popup.
+The AI calls `secret_request` with the current project's `workspace_root`. You see a native dialog labeled, for example, “Stripe test secret key for Acme billing,” paste the value there, and click **Save & Use**. The popup shows the workspace this authorizes. The AI receives an ID such as `sb_…`, then calls `env_write` with the same `workspace_root` and a relative path, without a second popup.
 
 ## Security boundary
 
