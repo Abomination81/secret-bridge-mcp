@@ -59,15 +59,16 @@ check_file() {
 }
 
 check_markers() {
-    # Reject duplicates, nesting, partial blocks, or altered marker lines.
-    awk -v begin="$begin_marker" -v end="$end_marker" '
+    # Reject duplicates, nesting, partial blocks, or altered marker lines. With a second
+    # argument, also require exactly one complete block (the template's contract).
+    awk -v begin="$begin_marker" -v end="$end_marker" -v need="${2:-}" '
         { line = $0; sub(/\r$/, "", line) }
         index(line, "secret-bridge-mcp:begin") || index(line, "secret-bridge-mcp:end") {
             if (line == begin && state == 0 && blocks == 0) { state = 1; next }
             if (line == end && state == 1) { state = 0; blocks++; next }
             bad = 1
         }
-        END { if (bad || state) exit 1 }
+        END { if (bad || state || (need != "" && blocks != 1)) exit 1 }
     ' "$1" || {
         echo "Malformed SecretBridge markers; leaving the file unchanged: $1" >&2
         return 1
@@ -95,13 +96,19 @@ prepare() {
     source_lines=$(awk 'END { print NR }' "$source_file")
     last_byte=$(tail -c 1 -- "$source_file" | od -An -tu1 | tr -d ' \n')
     source_crlf=$(awk '/\r$/ { print "yes"; exit }' "$source_file")
-    awk -v begin="$begin_marker" -v end="$end_marker" -v template="$template" \
+    # The template path goes through the environment: awk -v would expand backslashes in it.
+    SB_TEMPLATE=$template awk -v begin="$begin_marker" -v end="$end_marker" \
         -v total_lines="$source_lines" -v last_byte="$last_byte" -v crlf="$source_crlf" '
-        BEGIN { newline = crlf == "yes" ? "\r\n" : "\n" }
-        function insert_block( entry ) {
-            while ((getline entry < template) > 0) {
+        BEGIN { newline = crlf == "yes" ? "\r\n" : "\n"; template = ENVIRON["SB_TEMPLATE"] }
+        function insert_block( entry, status ) {
+            while ((status = (getline entry < template)) > 0) {
                 sub(/\r$/, "", entry)
                 printf "%s%s", entry, newline
+            }
+            if (status < 0) {
+                print "Cannot read the client instruction template: " template > "/dev/stderr"
+                failed = 1
+                exit 2
             }
             close(template)
         }
@@ -115,6 +122,7 @@ prepare() {
             }
         }
         END {
+            if (failed) exit 2
             if (!replaced) {
                 if (NR > 0) {
                     if (last_byte != "10") printf "%s", newline
@@ -127,7 +135,7 @@ prepare() {
 }
 
 check_file "$template"
-check_markers "$template"
+check_markers "$template" require
 if ! [ -s "$template" ]; then
     echo "Missing client instruction template: $template" >&2
     exit 1

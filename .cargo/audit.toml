@@ -1,0 +1,11 @@
+# cargo-audit settings. Every ignored advisory needs a reason and is revisited on upgrades.
+[advisories]
+ignore = [
+    # zvariant, zbus_names, and zvariant_derive are unmaintained because upstream merged them
+    # into zbus 6. They are Linux-only D-Bus dependencies of keyring's Secret Service store and
+    # eframe's AccessKit backend; the macOS and Windows release builds never compile them.
+    # Remove these entries once keyring and eframe move to zbus 6.
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
+]

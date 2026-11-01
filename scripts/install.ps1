@@ -7,7 +7,13 @@ $installDir = if ($env:SECRET_BRIDGE_INSTALL_DIR) {
     Join-Path $env:LOCALAPPDATA "SecretBridge"
 }
 
-cargo build --release --locked --manifest-path (Join-Path $projectDir "Cargo.toml")
+# Build into the project target directory explicitly, so a CARGO_TARGET_DIR or build.target-dir
+# setting cannot leave a stale binary at the path copied below.
+cargo build --release --locked --manifest-path (Join-Path $projectDir "Cargo.toml") --target-dir (Join-Path $projectDir "target")
+# $ErrorActionPreference does not apply to native commands; check the exit code.
+if ($LASTEXITCODE -ne 0) {
+    throw "cargo build failed with exit code $LASTEXITCODE; nothing was installed"
+}
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 $destination = Join-Path $installDir "secret-bridge-mcp.exe"
 if (Test-Path $destination) {
