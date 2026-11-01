@@ -12,6 +12,12 @@ use crate::registry::{Registry, SecretRecord};
 use crate::{AppConfig, SERVICE_NAME, ui};
 
 const SUPPORTED_PROTOCOLS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
+const TOOL_NAMES: [&str; 4] = [
+    "secret_request",
+    "secret_list",
+    "env_write",
+    "secret_delete",
+];
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_INTERACTIVE_REQUESTS_PER_MINUTE: usize = 10;
 
@@ -72,13 +78,36 @@ pub(crate) fn run_stdio(config: AppConfig) -> Result<(), String> {
                 continue;
             }
         };
-        let Some(response) = handle_message(&config, &registry, &mut interaction_gate, request)
+        let Some(response) = handle_payload(&config, &registry, &mut interaction_gate, request)
         else {
             continue;
         };
         write_message(&mut stdout, response)?;
     }
     Ok(())
+}
+
+/// Handles one JSON value from the wire: a single message or a JSON-RPC batch. A batch is
+/// answered with an array of responses, omitting notifications, as JSON-RPC 2.0 requires.
+fn handle_payload(
+    config: &AppConfig,
+    registry: &Registry,
+    interaction_gate: &mut InteractionGate,
+    payload: Value,
+) -> Option<Value> {
+    match payload {
+        Value::Array(batch) if batch.is_empty() => {
+            Some(error_response(Value::Null, -32600, "Invalid Request"))
+        }
+        Value::Array(batch) => {
+            let responses: Vec<Value> = batch
+                .into_iter()
+                .filter_map(|message| handle_message(config, registry, interaction_gate, message))
+                .collect();
+            (!responses.is_empty()).then_some(Value::Array(responses))
+        }
+        message => handle_message(config, registry, interaction_gate, message),
+    }
 }
 
 fn read_capped_line(reader: &mut impl BufRead, output: &mut Vec<u8>) -> io::Result<Option<bool>> {
@@ -130,11 +159,14 @@ fn handle_message(
     let Some(object) = request.as_object() else {
         return Some(error_response(Value::Null, -32600, "Invalid Request"));
     };
+    if !id.is_null() && !id.is_string() && !id.is_number() {
+        return Some(error_response(Value::Null, -32600, "Invalid Request"));
+    }
+    // A readable id is echoed even on an invalid request, so the client can match the reply.
     if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
         || object.get("method").and_then(Value::as_str).is_none()
-        || (!id.is_null() && !id.is_string() && !id.is_number())
     {
-        return Some(error_response(Value::Null, -32600, "Invalid Request"));
+        return Some(error_response(id, -32600, "Invalid Request"));
     }
     if !object.contains_key("id") {
         return None;
@@ -145,7 +177,15 @@ fn handle_message(
         "initialize" => initialize(config, &request),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tool_definitions(config) })),
-        "tools/call" => call_tool(config, registry, interaction_gate, &request),
+        "tools/call" => match request.pointer("/params/name").and_then(Value::as_str) {
+            Some(name) if TOOL_NAMES.contains(&name) => {
+                call_tool(config, registry, interaction_gate, name, &request)
+            }
+            Some(name) => {
+                return Some(error_response(id, -32602, &format!("Unknown tool: {name}")));
+            }
+            None => return Some(error_response(id, -32602, "Missing tool name")),
+        },
         _ => return Some(error_response(id, -32601, "Method not found")),
     };
 
@@ -196,28 +236,16 @@ fn call_tool(
     config: &AppConfig,
     registry: &Registry,
     interaction_gate: &mut InteractionGate,
+    name: &str,
     request: &Value,
 ) -> Result<Value, String> {
-    let name = request
-        .pointer("/params/name")
-        .and_then(Value::as_str)
-        .ok_or("missing tool name")?;
     let arguments = request
         .pointer("/params/arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    if !matches!(
-        name,
-        "secret_request" | "secret_list" | "env_write" | "secret_delete"
-    ) {
-        return Err(format!("unknown tool: {name}"));
-    }
     let (config, arguments) = scope_tool_arguments(config, arguments)?;
-    if matches!(name, "secret_request" | "env_write" | "secret_delete") {
-        interaction_gate.check()?;
-    }
     match name {
-        "secret_request" => secret_request(&config, registry, arguments),
+        "secret_request" => secret_request(&config, registry, interaction_gate, arguments),
         "secret_list" => {
             if !arguments
                 .as_object()
@@ -228,7 +256,7 @@ fn call_tool(
             secret_list(&config, registry)
         }
         "env_write" => env_write(&config, registry, arguments),
-        "secret_delete" => secret_delete(&config, registry, arguments),
+        "secret_delete" => secret_delete(&config, registry, interaction_gate, arguments),
         _ => Err(format!("unknown tool: {name}")),
     }
 }
@@ -262,6 +290,7 @@ struct SecretRequestArgs {
 fn secret_request(
     config: &AppConfig,
     registry: &Registry,
+    interaction_gate: &mut InteractionGate,
     arguments: Value,
 ) -> Result<Value, String> {
     let args: SecretRequestArgs = serde_json::from_value(arguments)
@@ -278,6 +307,17 @@ fn secret_request(
 
     let existing = registry.find_by_label(&label)?;
     if let Some(record) = &existing
+        && args.replace_existing
+        && !available_in_workspace(record, config)
+    {
+        // Replacing changes the value every granted workspace receives, so it must come from a
+        // workspace that already has access.
+        return Err(format!(
+            "\"{}\" is stored for another workspace. Request it without replace_existing first so the user can allow this workspace, then replace it.",
+            record.label
+        ));
+    }
+    if let Some(record) = &existing
         && !args.replace_existing
     {
         let entry = keyring_entry(&record.id)?;
@@ -285,11 +325,7 @@ fn secret_request(
             Ok(mut existing_value) => {
                 existing_value.zeroize();
                 let workspace = workspace_id(config);
-                let record = if record
-                    .allowed_workspaces
-                    .iter()
-                    .any(|allowed| allowed == &workspace)
-                {
+                let record = if available_in_workspace(record, config) {
                     record.clone()
                 } else {
                     let message = format!(
@@ -297,6 +333,7 @@ fn secret_request(
                         record.label,
                         config.workspace_root.display()
                     );
+                    interaction_gate.check()?;
                     if !ui::confirm(&config.client_name, "Grant workspace access", &message)? {
                         return Err("user denied workspace access to the stored secret".into());
                     }
@@ -325,6 +362,7 @@ fn secret_request(
 
     let replacing = existing.is_some();
     let provisional_id = format!("sb_{}", uuid::Uuid::new_v4().simple());
+    interaction_gate.check()?;
     let stored = ui::prompt_and_store_secret(
         &provisional_id,
         &config.client_name,
@@ -557,11 +595,7 @@ fn env_write_with(
         let record = registry
             .find_by_id(&mapping.secret_id)?
             .ok_or_else(|| format!("unknown secret_id: {}", mapping.secret_id))?;
-        if !record
-            .allowed_workspaces
-            .iter()
-            .any(|allowed| allowed == &workspace_id(config))
-        {
+        if !available_in_workspace(&record, config) {
             return Err(format!(
                 "secret_id {} is not authorized for this workspace; request it by label first",
                 mapping.secret_id
@@ -579,7 +613,7 @@ fn env_write_with(
             value: read_credential(&record.id)?,
         });
     }
-    write_env_file(&config.workspace_root, &target, &values)?;
+    write_env_file(&config.workspace_root, &target, &values, &config.data_dir)?;
     drop(values);
 
     let audit_recorded = audit_best_effort(registry.audit(
@@ -609,6 +643,7 @@ struct SecretDeleteArgs {
 fn secret_delete(
     config: &AppConfig,
     registry: &Registry,
+    interaction_gate: &mut InteractionGate,
     arguments: Value,
 ) -> Result<Value, String> {
     let args: SecretDeleteArgs = serde_json::from_value(arguments)
@@ -617,10 +652,25 @@ fn secret_delete(
     let record = registry
         .find_by_id(&args.secret_id)?
         .ok_or_else(|| format!("unknown secret_id: {}", args.secret_id))?;
+    if !available_in_workspace(&record, config) {
+        return Err(format!(
+            "secret_id {} is not available in this workspace; delete it from a workspace where it is available",
+            record.id
+        ));
+    }
+    let shared = record.allowed_workspaces.len().saturating_sub(1);
     let message = format!(
-        "Permanently delete this stored credential?\n\nLabel: {}\nSecret ID: {}\n\nExisting .env files will not be changed.",
-        record.label, record.id
+        "Permanently delete this stored credential?\n\nLabel: {}\nSecret ID: {}\nRequested from: {}{}\n\nExisting .env files will not be changed.",
+        record.label,
+        record.id,
+        config.workspace_root.display(),
+        match shared {
+            0 => String::new(),
+            1 => "\nAlso used by 1 other workspace.".into(),
+            count => format!("\nAlso used by {count} other workspaces."),
+        }
     );
+    interaction_gate.check()?;
     if !ui::confirm(&config.client_name, "Delete secret", &message)? {
         return Err("user denied secret deletion".into());
     }
@@ -673,6 +723,14 @@ fn validate_secret_id(id: &str) -> Result<(), String> {
 
 fn workspace_id(config: &AppConfig) -> String {
     config.workspace_root.to_string_lossy().into_owned()
+}
+
+fn available_in_workspace(record: &SecretRecord, config: &AppConfig) -> bool {
+    let workspace = workspace_id(config);
+    record
+        .allowed_workspaces
+        .iter()
+        .any(|allowed| allowed == &workspace)
 }
 
 fn audit_best_effort(result: Result<(), String>) -> bool {
@@ -1173,6 +1231,102 @@ mod tests {
             Some(false)
         );
         assert_eq!(line, b"{}\n");
+    }
+
+    #[test]
+    fn batches_and_invalid_requests_follow_json_rpc() {
+        let workspace = tempdir().unwrap();
+        let data = tempdir().unwrap();
+        let config = AppConfig::for_test(workspace.path(), data.path());
+        let registry = Registry::new(data.path());
+        let mut gate = InteractionGate::default();
+        let mut handle = |payload| handle_payload(&config, &registry, &mut gate, payload);
+
+        let batch = handle(json!([
+            { "jsonrpc": "2.0", "id": 1, "method": "ping" },
+            { "jsonrpc": "2.0", "method": "notifications/initialized" },
+            { "jsonrpc": "2.0", "id": "two", "method": "tools/list" }
+        ]))
+        .unwrap();
+        let batch = batch.as_array().unwrap();
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0]["id"], 1);
+        assert_eq!(batch[1]["id"], "two");
+        assert!(
+            handle(json!([{ "jsonrpc": "2.0", "method": "notifications/initialized" }])).is_none()
+        );
+        assert_eq!(handle(json!([])).unwrap()["error"]["code"], -32600);
+
+        let invalid = handle(json!({ "jsonrpc": "2.0", "id": 7, "method": 5 })).unwrap();
+        assert_eq!(invalid["id"], 7);
+        assert_eq!(invalid["error"]["code"], -32600);
+
+        let unknown = handle(json!({
+            "jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": { "name": "nope" }
+        }))
+        .unwrap();
+        assert_eq!(unknown["id"], 8);
+        assert_eq!(unknown["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn calls_that_open_no_popup_do_not_spend_the_popup_budget() {
+        let workspace = tempdir().unwrap();
+        let data = tempdir().unwrap();
+        let config = AppConfig::for_test(workspace.path(), &data.path().join("private"));
+        let registry = Registry::new(&config.data_dir);
+        let mut gate = InteractionGate::default();
+        for id in 0..(MAX_INTERACTIVE_REQUESTS_PER_MINUTE + 2) {
+            let response = handle_message(
+                &config,
+                &registry,
+                &mut gate,
+                json!({
+                    "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                    "params": { "name": "env_write", "arguments": { "path": ".env", "entries": [] } }
+                }),
+            )
+            .unwrap();
+            assert_eq!(response["result"]["isError"], true);
+        }
+        assert!(gate.recent.is_empty());
+    }
+
+    #[test]
+    fn other_workspaces_credentials_cannot_be_deleted_or_replaced_from_here() {
+        let workspace = tempdir().unwrap();
+        let other = tempdir().unwrap();
+        let data = tempdir().unwrap();
+        let config = AppConfig::for_test(workspace.path(), &data.path().join("private"));
+        let registry = Registry::new(&config.data_dir);
+        let id = "sb_0123456789abcdef0123456789abcdef";
+        registry
+            .insert_with_id(
+                id.into(),
+                "Other project key".into(),
+                "Belongs to another workspace".into(),
+                None,
+                other.path().to_string_lossy().into_owned(),
+            )
+            .unwrap();
+        let mut gate = InteractionGate::default();
+        let delete =
+            secret_delete(&config, &registry, &mut gate, json!({ "secret_id": id })).unwrap_err();
+        assert!(delete.contains("not available in this workspace"));
+        let replace = secret_request(
+            &config,
+            &registry,
+            &mut gate,
+            json!({
+                "label": "Other project key",
+                "description": "Attempted replacement",
+                "replace_existing": true
+            }),
+        )
+        .unwrap_err();
+        assert!(replace.contains("stored for another workspace"));
+        assert!(gate.recent.is_empty());
+        assert!(registry.find_by_id(id).unwrap().is_some());
     }
 
     #[test]

@@ -1,17 +1,27 @@
 //! AppKit owns the macOS dialog, typography, focus, dragging, and control rendering.
+use std::path::Path;
+
+use block2::RcBlock;
 use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
-use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
+use objc2::runtime::{Bool, ProtocolObject};
+use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::*;
 use objc2_foundation::{
-    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
-    NSString, NSURL, ns_string,
+    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSProcessInfo, NSRect,
+    NSSize, NSString, ns_string,
 };
 use zeroize::Zeroizing;
 
 use super::{
-    Mode, PROMPT_CANCELLED_EXIT_CODE, SERVICE_NAME, SecureInputGuard, ensure_entry_is_empty,
+    Mode, PROMPT_CANCELLED_EXIT_CODE, SERVICE_NAME, SecureInputGuard, credential_text,
+    ensure_entry_is_empty,
 };
+
+/// Width of the credential dialog's accessory content.
+const CONTENT_WIDTH: f64 = 300.0;
+const FIELD_HEIGHT: f64 = 28.0;
+const WELL_HEIGHT: f64 = 60.0;
+const LOCK_SIDE: f64 = 11.0;
 
 struct InputState {
     field: Retained<NSSecureTextField>,
@@ -31,9 +41,10 @@ define_class!(
         fn changed(&self, _notification: &NSNotification) {
             let state = self.ivars();
             let value = Zeroizing::new(state.field.stringValue().to_string());
+            let credential = credential_text(&value);
             state
                 .submit
-                .setEnabled(!value.is_empty() && value.len() <= 65_536);
+                .setEnabled(!credential.is_empty() && credential.len() <= 65_536);
             // Clear a pasted value without retaining or exposing clipboard contents. AppKit's
             // field editor owns the paste action, so inspect only after the field has changed.
             let pasteboard = NSPasteboard::generalPasteboard();
@@ -50,6 +61,203 @@ define_class!(
 
 fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
+}
+
+fn srgb(red: f64, green: f64, blue: f64) -> Retained<NSColor> {
+    NSColor::colorWithSRGBRed_green_blue_alpha(red / 255.0, green / 255.0, blue / 255.0, 1.0)
+}
+
+/// The SecretBridge app icon: a white padlock under a bridge arch on a green tile. It is drawn
+/// on demand, so it stays sharp at every backing scale without a bundled image file.
+fn app_icon(side: f64) -> Retained<NSImage> {
+    let draw = RcBlock::new(|bounds: NSRect| -> Bool {
+        // A 64-point design grid in a flipped context, so y grows downward.
+        let unit = bounds.size.width / 64.0;
+        let at = |x: f64, y: f64| NSPoint::new(x * unit, y * unit);
+        let frame = |x: f64, y: f64, width: f64, height: f64| {
+            rect(x * unit, y * unit, width * unit, height * unit)
+        };
+        let deep_green = srgb(27.0, 154.0, 71.0);
+        let tile = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+            frame(2.0, 2.0, 60.0, 60.0),
+            14.0 * unit,
+            14.0 * unit,
+        );
+        if let Some(gradient) = NSGradient::initWithStartingColor_endingColor(
+            NSGradient::alloc(),
+            &srgb(95.0, 219.0, 118.0),
+            &deep_green,
+        ) {
+            gradient.drawInBezierPath_angle(&tile, 90.0);
+        }
+        NSColor::whiteColor().set();
+        let arch = NSBezierPath::bezierPath();
+        arch.moveToPoint(at(11.0, 35.0));
+        arch.curveToPoint_controlPoint1_controlPoint2(
+            at(53.0, 35.0),
+            at(17.0, 15.0),
+            at(47.0, 15.0),
+        );
+        arch.setLineWidth(4.0 * unit);
+        arch.setLineCapStyle(NSLineCapStyle::Round);
+        arch.stroke();
+        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+            frame(20.0, 30.0, 24.0, 20.0),
+            5.0 * unit,
+            5.0 * unit,
+        )
+        .fill();
+        deep_green.set();
+        NSBezierPath::bezierPathWithOvalInRect(frame(29.4, 35.9, 5.2, 5.2)).fill();
+        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+            frame(30.8, 39.5, 2.4, 6.0),
+            1.2 * unit,
+            1.2 * unit,
+        )
+        .fill();
+        Bool::YES
+    });
+    NSImage::imageWithSize_flipped_drawingHandler(NSSize::new(side, side), true, &draw)
+}
+
+/// macOS 26 lays alerts out flush with the leading edge; earlier releases center them.
+fn alert_alignment() -> NSTextAlignment {
+    if NSProcessInfo::processInfo()
+        .operatingSystemVersion()
+        .majorVersion
+        >= 26
+    {
+        NSTextAlignment::Natural
+    } else {
+        NSTextAlignment::Center
+    }
+}
+
+fn single_line(
+    mtm: MainThreadMarker,
+    text: &str,
+    font: &NSFont,
+    secondary: bool,
+) -> Retained<NSTextField> {
+    let line = NSTextField::labelWithString(&NSString::from_str(text), mtm);
+    line.setFont(Some(font));
+    if secondary {
+        line.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    }
+    if let Some(cell) = line.cell() {
+        cell.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
+    }
+    line
+}
+
+/// The width a label needs to draw its text on one line.
+fn natural_width(label: &NSTextField) -> f64 {
+    label.cell().map_or(f64::MAX, |cell| {
+        cell.cellSizeForBounds(rect(0.0, 0.0, 1_000_000.0, 1_000_000.0))
+            .width
+            .ceil()
+    })
+}
+
+fn tilde_path(path: &Path) -> String {
+    match std::env::var_os("HOME").map(|home| path.strip_prefix(home)) {
+        Some(Ok(rest)) if rest.as_os_str().is_empty() => "~".into(),
+        Some(Ok(rest)) => format!("~/{}", rest.display()),
+        _ => path.display().to_string(),
+    }
+}
+
+/// A recessed well naming the workspace that Save & Use authorizes: the folder name, then its
+/// full location on a line of its own so a long name can never hide where the folder is.
+fn workspace_well(mtm: MainThreadMarker, workspace: &str) -> Retained<NSBox> {
+    let well = NSBox::initWithFrame(
+        NSBox::alloc(mtm),
+        rect(0.0, 0.0, CONTENT_WIDTH, WELL_HEIGHT),
+    );
+    well.setBoxType(NSBoxType::Custom);
+    well.setBorderWidth(0.0);
+    well.setTitlePosition(NSTitlePosition::NoTitle);
+    well.setCornerRadius(8.0);
+    // The quaternary label tint reads as a recessed well in both light and dark mode.
+    well.setFillColor(&NSColor::quaternaryLabelColor());
+    well.setContentViewMargins(NSSize::new(0.0, 0.0));
+    well.setToolTip(Some(&NSString::from_str(workspace)));
+    let Some(content) = well.contentView() else {
+        return well;
+    };
+
+    if let Some(folder) = NSImage::imageNamed(unsafe { NSImageNameFolder }) {
+        let icon = NSImageView::imageViewWithImage(&folder, mtm);
+        icon.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+        icon.setFrame(rect(10.0, 16.0, 28.0, 28.0));
+        content.addSubview(&icon);
+    }
+    let text_x = 46.0;
+    let text_width = CONTENT_WIDTH - text_x - 10.0;
+    let caption_font = NSFont::systemFontOfSize_weight(10.0, unsafe { NSFontWeightSemibold });
+    let caption = single_line(mtm, "USE IN", &caption_font, true);
+    caption.setFrame(rect(text_x, 40.0, text_width, 13.0));
+    content.addSubview(&caption);
+
+    let path = Path::new(workspace);
+    let name = path.file_name().map_or_else(
+        || workspace.to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let name_font = NSFont::systemFontOfSize_weight(12.0, unsafe { NSFontWeightMedium });
+    let folder_name = single_line(mtm, &name, &name_font, false);
+    folder_name.setFrame(rect(text_x, 23.0, text_width, 16.0));
+    content.addSubview(&folder_name);
+    let location = single_line(
+        mtm,
+        &tilde_path(path),
+        &NSFont::systemFontOfSize(11.0),
+        true,
+    );
+    location.setFrame(rect(text_x, 7.0, text_width, 15.0));
+    content.addSubview(&location);
+    well
+}
+
+/// The storage note under the controls, led by a small lock when the note fits on one line.
+fn footer_note(
+    mtm: MainThreadMarker,
+    text: &str,
+    tooltip: &NSString,
+    alignment: NSTextAlignment,
+) -> Retained<NSView> {
+    let note = label(mtm, text, rect(0.0, 0.0, CONTENT_WIDTH, 1.0), 11.0, true);
+    note.setAlignment(alignment);
+    note.setToolTip(Some(tooltip));
+    let height = fit_label(&note, CONTENT_WIDTH);
+    let container =
+        NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, CONTENT_WIDTH, height));
+    let text_width = natural_width(&note);
+    let row_width = LOCK_SIDE + 4.0 + text_width;
+    let lock =
+        NSImage::imageWithSystemSymbolName_accessibilityDescription(ns_string!("lock.fill"), None);
+    if let Some(lock) = lock.filter(|_| row_width <= CONTENT_WIDTH) {
+        let left = if alignment == NSTextAlignment::Center {
+            ((CONTENT_WIDTH - row_width) / 2.0).floor()
+        } else {
+            0.0
+        };
+        let icon = NSImageView::imageViewWithImage(&lock, mtm);
+        icon.setImageScaling(NSImageScaling::ScaleProportionallyDown);
+        icon.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
+        icon.setFrame(rect(
+            left,
+            ((height - LOCK_SIDE) / 2.0).floor(),
+            LOCK_SIDE,
+            LOCK_SIDE,
+        ));
+        icon.setToolTip(Some(tooltip));
+        container.addSubview(&icon);
+        note.setAlignment(NSTextAlignment::Natural);
+        note.setFrame(rect(left + LOCK_SIDE + 4.0, 0.0, text_width, height));
+    }
+    container.addSubview(&note);
+    container
 }
 
 fn label(
@@ -99,9 +307,12 @@ fn message_view(
     text: &str,
     width: f64,
     max_height: f64,
+    size: f64,
     secondary: bool,
+    alignment: NSTextAlignment,
 ) -> Retained<NSScrollView> {
-    let details = label(mtm, text, rect(0.0, 0.0, width, 1.0), 13.0, secondary);
+    let details = label(mtm, text, rect(0.0, 0.0, width, 1.0), size, secondary);
+    details.setAlignment(alignment);
     let natural_height = fit_label(&details, width);
     let overflow = natural_height > max_height;
     let scroll = NSScrollView::initWithFrame(
@@ -176,23 +387,13 @@ pub(super) fn run(mode: Mode, secure_input: Option<SecureInputGuard>) -> Result<
     app.finishLaunching();
     let alert = NSAlert::new(mtm);
     alert.setAlertStyle(NSAlertStyle::Informational);
-    let symbol = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-        ns_string!("lock.fill"),
-        Some(ns_string!("Secure credential")),
-    );
-    if let Some(symbol) = symbol {
-        let config = NSImageSymbolConfiguration::configurationWithHierarchicalColor(
-            &NSColor::secondaryLabelColor(),
-        );
-        let icon = symbol.imageWithSymbolConfiguration(&config);
-        if let Some(icon) = &icon {
-            icon.setSize(NSSize::new(28.0, 28.0));
-        }
-        // SAFETY: The image is created and configured on this same main thread.
-        unsafe {
-            alert.setIcon(icon.as_deref());
-        }
+    let icon = app_icon(64.0);
+    icon.setAccessibilityDescription(Some(ns_string!("SecretBridge")));
+    // SAFETY: The image is created and configured on this same main thread.
+    unsafe {
+        alert.setIcon(Some(&icon));
     }
+    let alignment = alert_alignment();
     let is_secret = matches!(mode, Mode::Secret { .. });
     let legacy = matches!(&mode, Mode::Secret { workspace, .. } if workspace.is_empty());
     let submit = alert.addButtonWithTitle(if legacy {
@@ -223,71 +424,67 @@ pub(super) fn run(mode: Mode, secure_input: Option<SecureInputGuard>) -> Result<
                 "Save a credential"
             }));
             alert.setInformativeText(&NSString::from_str(title));
-            let note = label(
+            // Stack bottom-up in AppKit coordinates: note, workspace well, field, details.
+            let note = footer_note(
                 mtm,
                 &if legacy {
                     "Saved in Keychain. Never sent to chat.".into()
                 } else {
                     format!("Saved in Keychain. Available to {client} here.")
                 },
-                rect(0.0, 0.0, 320.0, 1.0),
-                11.0,
-                true,
+                ns_string!(
+                    "Save & Use authorizes .env writes in this workspace without another prompt. Client names are supplied by the requesting process and are not verified. The credential is never sent to chat; local processes can read exported files."
+                ),
+                alignment,
             );
-            note.setAlignment(NSTextAlignment::Center);
-            let note_height = fit_label(&note, 320.0);
-            let scope_y = note_height + 12.0;
-            let input_y = scope_y + 64.0 + 16.0;
-            let details_y = input_y + 32.0 + 16.0;
+            let mut next_y = note.frame().size.height + 12.0;
+            // Older brokers send no workspace, so there is no destination to show.
+            let well = (!legacy).then(|| workspace_well(mtm, workspace));
+            if let Some(well) = &well {
+                well.setFrameOrigin(NSPoint::new(0.0, next_y));
+                next_y += WELL_HEIGHT + 8.0;
+            }
+            let input_y = next_y;
+            let details_y = input_y + FIELD_HEIGHT + 12.0;
             let max_height = NSScreen::mainScreen(mtm).map_or(220.0, |screen| {
                 (screen.visibleFrame().size.height - 420.0).clamp(80.0, 220.0)
             });
-            let scroll = message_view(mtm, description, 320.0, max_height, true);
+            let scroll = message_view(
+                mtm,
+                description,
+                CONTENT_WIDTH,
+                max_height,
+                11.0,
+                true,
+                alignment,
+            );
             scroll.setFrameOrigin(NSPoint::new(0.0, details_y));
             let accessory = NSView::initWithFrame(
                 NSView::alloc(mtm),
-                rect(0.0, 0.0, 320.0, details_y + scroll.frame().size.height),
+                rect(
+                    0.0,
+                    0.0,
+                    CONTENT_WIDTH,
+                    details_y + scroll.frame().size.height,
+                ),
             );
             accessory.addSubview(&scroll);
 
             let input = NSSecureTextField::initWithFrame(
                 NSSecureTextField::alloc(mtm),
-                rect(0.0, input_y, 320.0, 32.0),
+                rect(0.0, input_y, CONTENT_WIDTH, FIELD_HEIGHT),
             );
-            input.setFont(Some(&NSFont::systemFontOfSize(15.0)));
+            input.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+            input.setControlSize(NSControlSize::Large);
             input.setPlaceholderString(Some(ns_string!("API key or password")));
             input.setBezelStyle(NSTextFieldBezelStyle::RoundedBezel);
             if let Some(name) = env_var {
                 input.setToolTip(Some(&NSString::from_str(name)));
             }
             accessory.addSubview(&input);
-
-            let scope = NSBox::initWithFrame(NSBox::alloc(mtm), rect(0.0, scope_y, 320.0, 64.0));
-            scope.setBoxType(NSBoxType::Custom);
-            scope.setBorderWidth(0.0);
-            scope.setTitlePosition(NSTitlePosition::NoTitle);
-            scope.setCornerRadius(10.0);
-            scope.setFillColor(&NSColor::controlColor());
-            scope.setContentViewMargins(NSSize::new(0.0, 0.0));
-            let caption = label(mtm, "USE IN", rect(12.0, 39.0, 296.0, 14.0), 10.0, true);
-            caption.setFont(Some(&NSFont::systemFontOfSize_weight(10.0, unsafe {
-                NSFontWeightSemibold
-            })));
-            let path = NSPathControl::initWithFrame(
-                NSPathControl::alloc(mtm),
-                rect(10.0, 9.0, 300.0, 26.0),
-            );
-            path.setURL(Some(&NSURL::fileURLWithPath(&NSString::from_str(
-                workspace,
-            ))));
-            path.setEditable(false);
-            path.setToolTip(Some(&NSString::from_str(workspace)));
-            if let Some(content) = scope.contentView() {
-                content.addSubview(&caption);
-                content.addSubview(&path);
+            if let Some(well) = &well {
+                accessory.addSubview(well);
             }
-            accessory.addSubview(&scope);
-            note.setToolTip(Some(ns_string!("Save & Use authorizes .env writes in this workspace without another prompt. Client names are supplied by the requesting process and are not verified. The credential is never sent to chat; local processes can read exported files.")));
             accessory.addSubview(&note);
             alert.setAccessoryView(Some(&accessory));
             submit.setEnabled(false);
@@ -307,13 +504,22 @@ pub(super) fn run(mode: Mode, secure_input: Option<SecureInputGuard>) -> Result<
             client,
             title,
             message,
+            ..
         } => {
             alert.setMessageText(&NSString::from_str(title));
             alert.setInformativeText(&NSString::from_str(&format!("Requested by {client}")));
             let max_height = NSScreen::mainScreen(mtm).map_or(260.0, |screen| {
                 (screen.visibleFrame().size.height - 340.0).clamp(80.0, 260.0)
             });
-            let scroll = message_view(mtm, message, 340.0, max_height, false);
+            let scroll = message_view(
+                mtm,
+                message,
+                340.0,
+                max_height,
+                13.0,
+                false,
+                NSTextAlignment::Natural,
+            );
             alert.setAccessoryView(Some(&scroll));
             // Do not let Return approve deletion or a new workspace by accident.
             submit.setKeyEquivalent(ns_string!(""));
@@ -321,11 +527,10 @@ pub(super) fn run(mode: Mode, secure_input: Option<SecureInputGuard>) -> Result<
     }
     alert.layout();
     let window = alert.window();
+    // The dialog keeps its system shadow and follows the user's light or dark appearance.
     window.setTitle(ns_string!("SecretBridge"));
-    window.setHasShadow(false);
     window.setMovable(true);
     window.setMovableByWindowBackground(true);
-    window.setAppearance(NSAppearance::appearanceNamed(unsafe { NSAppearanceNameAqua }).as_deref());
     window.setLevel(3); // NSFloatingWindowLevel: stays findable while copying from another app.
     window.center();
     if let Some(input) = &field {
@@ -347,14 +552,15 @@ pub(super) fn run(mode: Mode, secure_input: Option<SecureInputGuard>) -> Result<
         let input = field.ok_or("credential field was unavailable")?;
         let value = Zeroizing::new(input.stringValue().to_string());
         input.setStringValue(ns_string!(""));
-        if value.is_empty() || value.len() > 65_536 {
+        let credential = credential_text(&value);
+        if credential.is_empty() || credential.len() > 65_536 {
             return Err("invalid credential length".into());
         }
         let entry = keyring::Entry::new(SERVICE_NAME, &secret_id)
             .map_err(|_| "could not access the operating-system credential store")?;
         ensure_entry_is_empty(&entry)?;
         entry
-            .set_password(&value)
+            .set_password(credential)
             .map_err(|_| "could not store the credential")?;
     }
     drop(secure_input);

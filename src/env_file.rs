@@ -1,11 +1,10 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
-#[cfg(unix)]
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Output};
 
+use fs2::FileExt;
 use zeroize::Zeroizing;
 
 const MAX_ENV_FILE_BYTES: u64 = 1024 * 1024;
@@ -78,11 +77,13 @@ pub fn resolve_env_path(root: &Path, requested: &str) -> Result<PathBuf, String>
     if !(file_name == ".env" || file_name.starts_with(".env.") || file_name == ".dev.vars") {
         return Err("target filename must be .env, .env.*, or .dev.vars".into());
     }
-    if TEMPLATE_FILENAMES.contains(&file_name)
-        || file_name.ends_with(".example")
-        || file_name.ends_with(".sample")
-        || file_name.ends_with(".template")
-        || file_name.ends_with(".dist")
+    // Case-insensitive filesystems treat .env.EXAMPLE as the committed .env.example.
+    let lowered = file_name.to_ascii_lowercase();
+    if TEMPLATE_FILENAMES.contains(&lowered.as_str())
+        || lowered.ends_with(".example")
+        || lowered.ends_with(".sample")
+        || lowered.ends_with(".template")
+        || lowered.ends_with(".dist")
     {
         return Err("refusing to write secrets to a committable env template file".into());
     }
@@ -112,13 +113,33 @@ pub fn resolve_env_path(root: &Path, requested: &str) -> Result<PathBuf, String>
     Ok(target)
 }
 
-pub fn write_env_file(root: &Path, target: &Path, values: &[EnvValue]) -> Result<(), String> {
+/// Merges `values` into the env file at `target`. `lock_dir` holds the lock that serializes
+/// env writes across SecretBridge processes, so concurrent sessions cannot drop each other's keys.
+pub fn write_env_file(
+    root: &Path,
+    target: &Path,
+    values: &[EnvValue],
+    lock_dir: &Path,
+) -> Result<(), String> {
     let relative = target
         .strip_prefix(root)
         .map_err(|_| "env target is outside the configured workspace".to_string())?;
     let requested = relative
         .to_str()
         .ok_or_else(|| "env target path must be UTF-8".to_string())?;
+    let lock = lock_env_writes(lock_dir)?;
+    let result = merge_env_file(root, target, relative, requested, values);
+    let _ = FileExt::unlock(&lock);
+    result
+}
+
+fn merge_env_file(
+    root: &Path,
+    target: &Path,
+    relative: &Path,
+    requested: &str,
+    values: &[EnvValue],
+) -> Result<(), String> {
     let revalidated = resolve_env_path(root, requested)?;
     if revalidated != target {
         return Err("env target changed before writing".into());
@@ -147,21 +168,51 @@ pub fn write_env_file(root: &Path, target: &Path, values: &[EnvValue]) -> Result
         .collect();
     let mut seen = HashSet::new();
     let mut output = Zeroizing::new(String::new());
+    // Keep the file's byte-order mark and line endings as they were.
+    let (bom, body) = match existing.strip_prefix('\u{feff}') {
+        Some(rest) => ("\u{feff}", rest),
+        None => ("", existing.as_str()),
+    };
+    let newline = if body.contains("\r\n") { "\r\n" } else { "\n" };
+    output.push_str(bom);
 
-    for line in existing.lines() {
-        if let Some(name) = assignment_name(line)
-            && let Some(value) = replacements.get(name)
-        {
-            if seen.insert(name.to_string()) {
-                output.push_str(name);
+    let lines: Vec<&str> = body.lines().collect();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        let Some(assignment) = parse_assignment(line) else {
+            output.push_str(line);
+            output.push_str(newline);
+            index += 1;
+            continue;
+        };
+        // A quoted value may continue over later lines. Those lines belong to this key: they
+        // are never read as assignments, and they leave the file when the key is replaced.
+        // An unterminated quote with no closing line is treated as a single-line value.
+        let end = unterminated_quote(assignment.value)
+            .and_then(|quote| {
+                lines[index + 1..]
+                    .iter()
+                    .position(|continuation| closes_quote(continuation, quote))
+            })
+            .map_or(index, |offset| index + 1 + offset);
+        if let Some(value) = replacements.get(assignment.name) {
+            if seen.insert(assignment.name.to_string()) {
+                if assignment.exported {
+                    output.push_str("export ");
+                }
+                output.push_str(assignment.name);
                 output.push('=');
                 append_encoded_dotenv(&mut output, value)?;
-                output.push('\n');
+                output.push_str(newline);
             }
-            continue;
+        } else {
+            for kept in &lines[index..=end] {
+                output.push_str(kept);
+                output.push_str(newline);
+            }
         }
-        output.push_str(line);
-        output.push('\n');
+        index = end + 1;
     }
 
     for entry in values {
@@ -169,21 +220,27 @@ pub fn write_env_file(root: &Path, target: &Path, values: &[EnvValue]) -> Result
             output.push_str(&entry.name);
             output.push('=');
             append_encoded_dotenv(&mut output, &entry.value)?;
-            output.push('\n');
+            output.push_str(newline);
         }
     }
 
     secure_write(target, output.as_bytes())
 }
 
-fn assignment_name(line: &str) -> Option<&str> {
+struct Assignment<'a> {
+    name: &'a str,
+    exported: bool,
+    value: &'a str,
+}
+
+fn parse_assignment(line: &str) -> Option<Assignment<'_>> {
     let line = line.trim_start();
-    let line = line.strip_prefix("export ").unwrap_or(line);
-    let (name, _) = line.split_once('=')?;
+    let (exported, line) = match line.strip_prefix("export") {
+        Some(rest) if rest.starts_with([' ', '\t']) => (true, rest.trim_start()),
+        _ => (false, line),
+    };
+    let (name, value) = line.split_once('=')?;
     let name = name.trim();
-    if name.is_empty() {
-        return None;
-    }
     let mut chars = name.chars();
     let first = chars.next()?;
     if !(first == '_' || first.is_ascii_alphabetic())
@@ -191,7 +248,55 @@ fn assignment_name(line: &str) -> Option<&str> {
     {
         return None;
     }
-    Some(name)
+    Some(Assignment {
+        name,
+        exported,
+        value,
+    })
+}
+
+/// The quote character a value opens without closing it on the same line, if any.
+fn unterminated_quote(value: &str) -> Option<char> {
+    let value = value.trim_start();
+    let quote = value
+        .chars()
+        .next()
+        .filter(|character| matches!(character, '"' | '\'' | '`'))?;
+    (!closes_quote(&value[quote.len_utf8()..], quote)).then_some(quote)
+}
+
+/// Whether `text` contains `quote` unescaped. Single-quoted dotenv values have no escapes.
+fn closes_quote(text: &str, quote: char) -> bool {
+    let mut escaped = false;
+    for character in text.chars() {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' && quote != '\'' {
+            escaped = true;
+        } else if character == quote {
+            return true;
+        }
+    }
+    false
+}
+
+fn lock_env_writes(lock_dir: &Path) -> Result<File, String> {
+    crate::secure_create_dir(lock_dir)?;
+    let path = lock_dir.join("env-write.lock");
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| format!("cannot open env write lock: {error}"))?;
+    file.lock_exclusive()
+        .map_err(|error| format!("cannot lock env writes: {error}"))?;
+    Ok(file)
 }
 
 fn append_encoded_dotenv(encoded: &mut String, value: &str) -> Result<(), String> {
@@ -299,15 +404,56 @@ fn read_small_file(path: &Path, max_bytes: u64, kind: &str) -> Result<String, St
     Ok(contents)
 }
 
-fn git_status(root: &Path, args: &[&str]) -> Result<bool, String> {
-    let git = trusted_git_path()?;
-    let output = Command::new(git).arg("-C").arg(root).args(args).output();
-    match output {
-        Ok(output) => Ok(output.status.success()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Err("git is required to verify that env targets cannot be committed".into())
+fn run_git(root: &Path, args: &[&str]) -> Result<Output, String> {
+    let mut command = Command::new(trusted_git_path()?);
+    // Inherited GIT_DIR, GIT_WORK_TREE, and similar overrides could aim the checks at a
+    // different repository. A fixed locale keeps git's messages recognizable.
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(key);
         }
-        Err(error) => Err(format!("cannot run git safety check: {error}")),
+    }
+    command
+        .env("LC_ALL", "C")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => {
+                "git is required to verify that env targets cannot be committed".into()
+            }
+            _ => format!("cannot run git safety check: {error}"),
+        })
+}
+
+/// A git check that could not run must stop the write: treating it as "not a repository"
+/// would silently skip the tracked and ignored checks.
+fn git_failure(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail: String = stderr
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(200)
+        .collect();
+    if detail.contains("xcrun: error") {
+        return "git safety checks need the Xcode Command Line Tools; run xcode-select --install, then retry".into();
+    }
+    format!(
+        "git could not verify that the env target is safe ({detail}); refusing to write secrets"
+    )
+}
+
+/// Runs a git query where exit status 0 means yes and 1 means no.
+fn git_query(root: &Path, args: &[&str]) -> Result<bool, String> {
+    let output = run_git(root, args)?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(git_failure(&output)),
     }
 }
 
@@ -339,7 +485,17 @@ fn trusted_git_path() -> Result<PathBuf, String> {
 }
 
 fn is_git_workspace(root: &Path) -> Result<bool, String> {
-    git_status(root, &["rev-parse", "--is-inside-work-tree"])
+    let output = run_git(root, &["rev-parse", "--is-inside-work-tree"])?;
+    if output.status.success() {
+        return match String::from_utf8_lossy(&output.stdout).trim() {
+            "true" => Ok(true),
+            _ => Err("the workspace is inside a git directory rather than a work tree".into()),
+        };
+    }
+    if String::from_utf8_lossy(&output.stderr).contains("not a git repository") {
+        return Ok(false);
+    }
+    Err(git_failure(&output))
 }
 
 fn path_arg(path: &Path) -> Result<&str, String> {
@@ -351,8 +507,10 @@ fn refuse_tracked_target(root: &Path, relative: &Path) -> Result<(), String> {
     if !is_git_workspace(root)? {
         return Ok(());
     }
-    let relative = path_arg(relative)?;
-    if git_status(root, &["ls-files", "--error-unmatch", "--", relative])? {
+    // Match case-insensitively: on macOS and Windows .env.PRODUCTION is the tracked
+    // .env.production. A literal pathspec keeps *, ?, and [ in names from acting as globs.
+    let pathspec = format!(":(icase,literal){}", path_arg(relative)?);
+    if git_query(root, &["ls-files", "--error-unmatch", "--", &pathspec])? {
         return Err("refusing to write secrets to a file already tracked by git; remove it from the index first".into());
     }
     Ok(())
@@ -363,7 +521,7 @@ fn verify_gitignored(root: &Path, relative: &Path) -> Result<(), String> {
         return Ok(());
     }
     let relative = path_arg(relative)?;
-    if !git_status(root, &["check-ignore", "--no-index", "-q", "--", relative])? {
+    if !git_query(root, &["check-ignore", "--no-index", "-q", "--", relative])? {
         return Err(
             "git does not report the env target as ignored; refusing to write secrets".into(),
         );
@@ -375,20 +533,29 @@ fn secure_write(path: &Path, contents: &[u8]) -> Result<(), String> {
     atomic_write(path, contents, 0o600, "env file")
 }
 
+/// A temporary sibling for an atomic replace. The name matches the `.env*` ignore rule, so a
+/// copy stranded by a crash is never committed.
+#[cfg(any(unix, target_os = "windows"))]
+fn temporary_sibling(path: &Path) -> PathBuf {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    path.with_file_name(format!(
+        ".env.secretbridge.{}.{}.tmp",
+        std::process::id(),
+        nonce
+    ))
+}
+
 fn atomic_write(path: &Path, contents: &[u8], _unix_mode: u32, kind: &str) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let temp = path.with_file_name(format!(
-            ".secretbridge.{}.{}.tmp",
-            std::process::id(),
-            nonce
-        ));
+        let temp = temporary_sibling(path);
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -396,7 +563,13 @@ fn atomic_write(path: &Path, contents: &[u8], _unix_mode: u32, kind: &str) -> Re
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&temp)
             .map_err(|error| format!("cannot create temporary {kind}: {error}"))?;
-        if let Err(error) = file.write_all(contents).and_then(|()| file.sync_all()) {
+        // Set the final mode on the open file before it becomes visible; changing it by path
+        // after the rename could follow a symlink swapped into place.
+        if let Err(error) = file
+            .set_permissions(fs::Permissions::from_mode(_unix_mode))
+            .and_then(|()| file.write_all(contents))
+            .and_then(|()| file.sync_all())
+        {
             let _ = fs::remove_file(&temp);
             return Err(format!("cannot write {kind}: {error}"));
         }
@@ -405,37 +578,30 @@ fn atomic_write(path: &Path, contents: &[u8], _unix_mode: u32, kind: &str) -> Re
             let _ = fs::remove_file(&temp);
             return Err(format!("cannot commit {kind}: {error}"));
         }
-        fs::set_permissions(path, fs::Permissions::from_mode(_unix_mode))
-            .map_err(|error| format!("cannot secure {kind} permissions: {error}"))?;
         Ok(())
     }
 
     #[cfg(target_os = "windows")]
     {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let temp = path.with_file_name(format!(
-            ".secretbridge.{}.{}.tmp",
-            std::process::id(),
-            nonce
-        ));
+        let temp = temporary_sibling(path);
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&temp)
             .map_err(|error| format!("cannot open {kind}: {error}"))?;
-        file.write_all(contents)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| format!("cannot write {kind}: {error}"))?;
+        if let Err(error) = file.write_all(contents).and_then(|()| file.sync_all()) {
+            drop(file);
+            let _ = fs::remove_file(&temp);
+            return Err(format!("cannot write {kind}: {error}"));
+        }
         drop(file);
         if path.exists() {
             replace_file_windows(path, &temp, kind)
         } else {
-            fs::rename(&temp, path).map_err(|error| format!("cannot commit {kind}: {error}"))
+            fs::rename(&temp, path).map_err(|error| {
+                let _ = fs::remove_file(&temp);
+                format!("cannot commit {kind}: {error}")
+            })
         }
     }
 
@@ -484,6 +650,10 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn locks(temp: &tempfile::TempDir) -> PathBuf {
+        temp.path().join("locks")
+    }
+
     #[test]
     fn rejects_public_secret_names() {
         assert!(validate_env_name("OPENAI_API_KEY").is_ok());
@@ -513,7 +683,13 @@ mod tests {
             name: "TOKEN".into(),
             value: Zeroizing::new("new value$".into()),
         }];
-        write_env_file(temp.path(), &temp.path().join(".env"), &values).unwrap();
+        write_env_file(
+            temp.path(),
+            &temp.path().join(".env"),
+            &values,
+            &locks(&temp),
+        )
+        .unwrap();
         let result = fs::read_to_string(temp.path().join(".env")).unwrap();
         assert_eq!(result, "KEEP=yes\nTOKEN=\"new value\\$\"\n");
         assert!(
@@ -521,6 +697,123 @@ mod tests {
                 .unwrap()
                 .contains(".env*")
         );
+    }
+
+    fn token(value: &str) -> Vec<EnvValue> {
+        vec![EnvValue {
+            name: "TOKEN".into(),
+            value: Zeroizing::new(value.into()),
+        }]
+    }
+
+    #[test]
+    fn replacing_a_multiline_value_removes_every_line_of_the_old_one() {
+        let temp = tempdir().unwrap();
+        let target = temp.path().join(".env");
+        fs::write(
+            &target,
+            "A=1\nTOKEN=\"-----BEGIN KEY-----\nOLDSECRETBODY\n-----END KEY-----\"\nPEM=\"first\nTOKEN=inside-another-value\nlast\"\nB=2\n",
+        )
+        .unwrap();
+        write_env_file(temp.path(), &target, &token("new"), &locks(&temp)).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "A=1\nTOKEN=\"new\"\nPEM=\"first\nTOKEN=inside-another-value\nlast\"\nB=2\n"
+        );
+    }
+
+    #[test]
+    fn an_unterminated_quote_never_swallows_the_rest_of_the_file() {
+        let temp = tempdir().unwrap();
+        let target = temp.path().join(".env");
+        fs::write(&target, "TOKEN=\"broken\nKEEP=yes\n").unwrap();
+        write_env_file(temp.path(), &target, &token("new"), &locks(&temp)).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "TOKEN=\"new\"\nKEEP=yes\n"
+        );
+    }
+
+    #[test]
+    fn keeps_bom_crlf_and_export_prefixes() {
+        let temp = tempdir().unwrap();
+        let target = temp.path().join(".env");
+        fs::write(&target, "\u{feff}export\tTOKEN=old\r\nKEEP=yes\r\n").unwrap();
+        write_env_file(temp.path(), &target, &token("new"), &locks(&temp)).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "\u{feff}export TOKEN=\"new\"\r\nKEEP=yes\r\n"
+        );
+    }
+
+    #[test]
+    fn concurrent_writers_keep_each_others_keys() {
+        let temp = tempdir().unwrap();
+        let target = temp.path().join(".env");
+        fs::write(&target, "KEEP=1\n").unwrap();
+        let lock_dir = locks(&temp);
+        std::thread::scope(|scope| {
+            for name in ["FIRST_KEY", "SECOND_KEY"] {
+                let (root, target, lock_dir) = (temp.path(), &target, &lock_dir);
+                scope.spawn(move || {
+                    for round in 0..10 {
+                        let values = vec![EnvValue {
+                            name: name.into(),
+                            value: Zeroizing::new(format!("value-{round}")),
+                        }];
+                        write_env_file(root, target, &values, lock_dir).unwrap();
+                    }
+                });
+            }
+        });
+        let contents = fs::read_to_string(&target).unwrap();
+        assert!(contents.contains("KEEP=1"));
+        assert!(contents.contains("FIRST_KEY=\"value-9\""));
+        assert!(contents.contains("SECOND_KEY=\"value-9\""));
+    }
+
+    fn git_init(path: &Path) {
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[test]
+    fn letter_case_does_not_get_around_tracked_or_template_checks() {
+        let temp = tempdir().unwrap();
+        git_init(temp.path());
+        fs::write(temp.path().join(".env.production"), "TOKEN=old\n").unwrap();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(temp.path())
+                .args(["add", "-f", ".env.production"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let target = temp.path().join(".env.PRODUCTION");
+        let error =
+            write_env_file(temp.path(), &target, &token("dummy"), &locks(&temp)).unwrap_err();
+        assert!(error.contains("already tracked by git"));
+        assert!(resolve_env_path(temp.path(), ".env.EXAMPLE").is_err());
+    }
+
+    #[test]
+    fn a_git_check_that_cannot_run_refuses_the_write() {
+        let temp = tempdir().unwrap();
+        git_init(temp.path());
+        fs::write(temp.path().join(".git").join("config"), "[core\nbroken").unwrap();
+        let target = temp.path().join(".env");
+        let error =
+            write_env_file(temp.path(), &target, &token("dummy"), &locks(&temp)).unwrap_err();
+        assert!(error.contains("could not verify"), "{error}");
+        assert!(!target.exists());
     }
 
     #[cfg(unix)]
@@ -536,7 +829,15 @@ mod tests {
             name: "TOKEN".into(),
             value: Zeroizing::new("dummy".into()),
         }];
-        assert!(write_env_file(temp.path(), &temp.path().join(".env"), &values).is_err());
+        assert!(
+            write_env_file(
+                temp.path(),
+                &temp.path().join(".env"),
+                &values,
+                &locks(&temp)
+            )
+            .is_err()
+        );
         assert_eq!(fs::read_to_string(outside).unwrap(), "keep\n");
     }
 
@@ -556,7 +857,7 @@ mod tests {
             value: Zeroizing::new("dummy".into()),
         }];
         let target = temp.path().join(".dev.vars");
-        write_env_file(temp.path(), &target, &values).unwrap();
+        write_env_file(temp.path(), &target, &values, &locks(&temp)).unwrap();
         assert!(
             fs::read_to_string(temp.path().join(".gitignore"))
                 .unwrap()
@@ -591,7 +892,7 @@ mod tests {
             name: "TOKEN".into(),
             value: Zeroizing::new("dummy".into()),
         }];
-        let error = write_env_file(temp.path(), &target, &values).unwrap_err();
+        let error = write_env_file(temp.path(), &target, &values, &locks(&temp)).unwrap_err();
         assert!(error.contains("already tracked by git"));
     }
 }

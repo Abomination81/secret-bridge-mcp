@@ -66,6 +66,11 @@ fn parse_args() -> Result<AppConfig, String> {
     if workspace_per_request && workspace_root.is_some() {
         return Err("--workspace-per-request cannot be combined with --workspace-root".into());
     }
+    if workspace_per_request {
+        // Every call names its own workspace, so the launch directory is never used and may
+        // already be gone (for example a removed worktree).
+        workspace_root = Some(env::temp_dir());
+    }
     let mut config = AppConfig::new_with_data_dir(workspace_root, client_name, data_dir)?;
     config.workspace_per_request = workspace_per_request;
     Ok(config)

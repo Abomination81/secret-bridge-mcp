@@ -1,5 +1,7 @@
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::thread;
 
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
@@ -29,12 +31,31 @@ enum Mode {
         #[serde(default)]
         workspace: String,
         replacing: bool,
+        /// Set by brokers that keep the prompt's stdin open until it exits.
+        #[serde(default)]
+        watch_parent: bool,
     },
     Confirm {
         client: String,
         title: String,
         message: String,
+        #[serde(default)]
+        watch_parent: bool,
     },
+}
+
+impl Mode {
+    fn watch_parent(&self) -> bool {
+        match self {
+            Mode::Secret { watch_parent, .. } | Mode::Confirm { watch_parent, .. } => *watch_parent,
+        }
+    }
+}
+
+/// The credential to store from what the field holds. Pasted keys often carry a trailing
+/// newline or stray spaces, and none of that belongs to the credential.
+fn credential_text(value: &str) -> &str {
+    value.trim()
 }
 
 fn validate_ui_text(
@@ -103,6 +124,7 @@ pub(crate) fn prompt_and_store_secret(
         env_var: env_var.map(str::to_string),
         workspace: workspace.to_string(),
         replacing,
+        watch_parent: true,
     })
 }
 
@@ -114,12 +136,24 @@ pub(crate) fn confirm(client: &str, title: &str, message: &str) -> Result<bool, 
         client: client.to_string(),
         title: title.to_string(),
         message: message.to_string(),
+        watch_parent: true,
+    })
+}
+
+fn prompt_executable() -> std::io::Result<PathBuf> {
+    let path = std::env::current_exe()?;
+    path.canonicalize().or_else(|error| {
+        // After an in-place upgrade Linux reports "<path> (deleted)"; the installed path now
+        // holds the new build, which accepts this broker's requests.
+        path.to_str()
+            .and_then(|text| text.strip_suffix(" (deleted)"))
+            .ok_or(error)
+            .and_then(|installed| PathBuf::from(installed).canonicalize())
     })
 }
 
 fn run_prompt_process(mode: Mode) -> Result<bool, String> {
-    let executable = std::env::current_exe()
-        .and_then(|path| path.canonicalize())
+    let executable = prompt_executable()
         .map_err(|error| format!("cannot resolve the SecretBridge executable: {error}"))?;
     let mut command = Command::new(executable);
     command
@@ -140,20 +174,24 @@ fn run_prompt_process(mode: Mode) -> Result<bool, String> {
         .spawn()
         .map_err(|error| format!("cannot start the native prompt: {error}"))?;
 
-    let write_result = child
-        .stdin
-        .take()
+    let mut input = child.stdin.take();
+    let write_result = input
+        .as_mut()
         .ok_or_else(|| "native prompt input is unavailable".to_string())
-        .and_then(|mut input| {
-            serde_json::to_writer(&mut input, &mode)
+        .and_then(|input| {
+            serde_json::to_writer(&mut *input, &mode)
                 .map_err(|error| format!("cannot encode native prompt request: {error}"))?;
             input
-                .flush()
+                .write_all(b"\n")
+                .and_then(|()| input.flush())
                 .map_err(|error| format!("cannot send native prompt request: {error}"))
         });
+    // Hold stdin open while the prompt runs. If this broker dies, the pipe closes and the
+    // prompt closes itself instead of storing a credential that no client will receive.
     let status = child
         .wait()
         .map_err(|error| format!("cannot wait for the native prompt: {error}"))?;
+    drop(input);
     write_result?;
 
     match status.code() {
@@ -183,17 +221,22 @@ pub fn run_desktop(config: AppConfig) -> Result<(), String> {
 }
 
 pub fn run_native_prompt_child() -> Result<u8, String> {
+    // Current brokers end the request with a newline and keep the pipe open; older ones send
+    // the request alone and close it. Reading to the first newline handles both.
     let mut encoded = Vec::new();
     std::io::stdin()
         .lock()
         .take(MAX_PROMPT_REQUEST_BYTES + 1)
-        .read_to_end(&mut encoded)
+        .read_until(b'\n', &mut encoded)
         .map_err(|error| format!("cannot read native prompt request: {error}"))?;
     if encoded.len() as u64 > MAX_PROMPT_REQUEST_BYTES {
         return Err("native prompt request is too large".into());
     }
     let mode: Mode = serde_json::from_slice(&encoded)
         .map_err(|error| format!("invalid native prompt request: {error}"))?;
+    if mode.watch_parent() {
+        exit_when_broker_exits();
+    }
 
     let secure_input = match &mode {
         Mode::Secret {
@@ -224,6 +267,7 @@ pub fn run_native_prompt_child() -> Result<u8, String> {
             client,
             title,
             message,
+            ..
         } => {
             validate_ui_text("client", client, 1, 80, false)?;
             validate_ui_text("title", title, 1, 80, false)?;
@@ -241,6 +285,27 @@ pub fn run_native_prompt_child() -> Result<u8, String> {
         fallback::run_request_window(mode, secure_input)?;
         Ok(PROMPT_CANCELLED_EXIT_CODE)
     }
+}
+
+/// The broker holds this process's stdin open until the prompt exits, so end-of-file means it
+/// is gone. Close the prompt then: a credential saved now would be stored under an ID that no
+/// client receives, and the dialog would float with nothing waiting for its answer.
+fn exit_when_broker_exits() {
+    let _ = thread::Builder::new()
+        .name("secret-bridge-broker-watch".into())
+        .spawn(|| {
+            let mut stdin = std::io::stdin();
+            let mut discard = [0u8; 64];
+            loop {
+                match stdin.read(&mut discard) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            std::process::exit(i32::from(PROMPT_CANCELLED_EXIT_CODE));
+        });
 }
 
 #[cfg(target_os = "macos")]
@@ -306,6 +371,7 @@ mod tests {
             env_var: Some("TEST_CREDENTIAL".into()),
             workspace: "/test/workspace".into(),
             replacing: false,
+            watch_parent: true,
         };
         let encoded = serde_json::to_value(mode).expect("serialize prompt metadata");
         let object = encoded.as_object().expect("prompt request object");
@@ -318,6 +384,29 @@ mod tests {
         assert!(!object.contains_key("value"));
         assert!(!object.contains_key("password"));
     }
+    #[test]
+    fn pasted_line_endings_and_padding_are_not_part_of_the_credential() {
+        assert_eq!(credential_text("sk-abc\n"), "sk-abc");
+        assert_eq!(credential_text("  sk-abc \r\n"), "sk-abc");
+        assert_eq!(credential_text("in ner"), "in ner");
+        assert!(credential_text("\n\t ").is_empty());
+    }
+
+    #[test]
+    fn only_current_brokers_ask_the_prompt_to_watch_for_them() {
+        let current: Mode = serde_json::from_value(serde_json::json!({
+            "kind": "confirm", "client": "Client", "title": "Delete secret",
+            "message": "Message", "watch_parent": true
+        }))
+        .unwrap();
+        assert!(current.watch_parent());
+        let older: Mode = serde_json::from_value(serde_json::json!({
+            "kind": "confirm", "client": "Client", "title": "Delete secret", "message": "Message"
+        }))
+        .unwrap();
+        assert!(!older.watch_parent());
+    }
+
     #[test]
     fn older_brokers_can_still_open_entry_during_an_update() {
         let mode: Mode = serde_json::from_value(serde_json::json!({

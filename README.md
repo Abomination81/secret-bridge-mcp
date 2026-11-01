@@ -56,7 +56,7 @@ The accompanying MCP message tells the AI that secure entry was confirmed and it
 `env_write` also:
 
 - rejects absolute paths, `..`, symlink targets/parents, and paths outside the request workspace;
-- refuses committable templates such as `.env.example`, targets already tracked by Git, and targets Git does not report as ignored;
+- refuses committable templates such as `.env.example`, targets already tracked by Git (in any letter case), and targets Git does not report as ignored, and refuses the write if Git cannot answer;
 - rejects client-bundled prefixes such as `NEXT_PUBLIC_`, `VITE_`, and `REACT_APP_`;
 - adds safe `.env*`/`.dev.vars` ignore rules and template exceptions to the workspace `.gitignore` when needed;
 - refuses a symlinked `.gitignore`, caps existing env files at 1 MiB, writes mode `0600` on macOS, and preserves unrelated existing variables;
@@ -64,7 +64,7 @@ The accompanying MCP message tells the AI that secure entry was confirmed and it
 
 Submitting **Save & Use** grants storage and use within the workspace displayed in the popup, including subsequent `.env` writes without another approval. Reuse from another workspace still requires a one-time native grant. Deletion still requires confirmation.
 
-On macOS the popup uses AppKit controls, system typography, a lock symbol, and Finder-style workspace breadcrumbs. Drag the dialog background to move it. The popup grows to fit the request message. Unusually long messages have a visible scrollbar, while the input and buttons stay visible. Standard editing shortcuts, including ⌘V, work in the secure field; Return submits a filled credential and Escape cancels. Windows uses the simplified light layout with a dedicated drag area.
+On macOS the popup is a native alert with the SecretBridge icon, system typography, and a workspace well that shows the folder Save & Use authorizes and its full location. It follows your light or dark appearance. Leading and trailing whitespace, such as the newline a copied key often carries, is not stored. Drag the dialog background to move it. The popup grows to fit the request message. Unusually long messages have a visible scrollbar, while the input and buttons stay visible. Standard editing shortcuts, including ⌘V, work in the secure field; Return submits a filled credential and Escape cancels. Windows uses the simplified light layout with a dedicated drag area.
 
 **Upgrading to 0.2:** existing workspace grants also authorize `.env` writes without a second popup. This changes the earlier per-write approval behavior; the workspace, path, Git-ignore, and variable-name checks remain enforced.
 

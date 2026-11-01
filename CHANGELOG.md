@@ -2,6 +2,38 @@
 
 All notable changes to SecretBridge are documented here.
 
+## 0.4.0 - 2026-11-01
+
+### macOS popup
+
+- Redesigned the credential popup: the SecretBridge app icon replaces the gray lock, request details sit in smaller secondary text, the field uses the standard large control size, and a recessed well shows the authorized folder's name with its full location beneath it. The storage note leads with a lock when it fits on one line.
+- The popup follows the system light or dark appearance and keeps its window shadow. Alignment follows the system alert style: flush left on macOS 26, centered on earlier releases.
+- Leading and trailing whitespace is no longer stored as part of a credential, so a pasted key with a trailing newline works. This applies to the Windows popup too.
+- If the MCP server exits while a popup is open, the popup now closes and stores nothing, instead of saving a credential no client would receive.
+
+### Safety fixes
+
+- The registry now refuses writes that its reads would reject. Previously a 101st workspace grant, or a workspace path with an invisible character reached through a symlink, saved successfully and then made the registry unreadable for every session.
+- Labels, descriptions, and workspace paths reject Unicode line and paragraph separators and invisible tag characters, which could push the real workspace out of view in a dialog. Resolved workspace paths are validated too and must be UTF-8.
+- A credential can be deleted, or replaced with `replace_existing`, only from a workspace where it is available. The deletion dialog now names the requesting workspace.
+- Env writes refuse when Git cannot verify the target (for example a broken config or an untrusted repository) instead of skipping the tracked and ignored checks. Inherited `GIT_*` variables are cleared, and the tracked-file check is case-insensitive, so `.env.PRODUCTION` no longer bypasses a committed `.env.production`. Template names are matched case-insensitively too.
+- Concurrent env writes from different sessions are serialized and no longer lose each other's variables.
+- Replacing a variable whose old value spans several quoted lines now removes every line of the old value. A byte-order mark, CRLF line endings, and `export` prefixes are preserved.
+- Temporary files are named `.env.secretbridge.*` so the `.env*` ignore rule covers any left behind by a crash, get their final permissions before they become visible, and are removed on Windows write errors.
+
+### Protocol
+
+- JSON-RPC batches are answered as batches; invalid requests echo a readable id; unknown tools return error -32602.
+- Only actual popups count toward the 10-per-minute limit; `env_write` and already-authorized reuse no longer use it up.
+- `--workspace-per-request` servers no longer need a valid launch directory, so a server started from a removed worktree still starts.
+
+### Setup and CI
+
+- `install.ps1` stops when `cargo build` fails instead of installing a stale binary, and both install scripts build into the project's own `target` directory.
+- `enable-defaults.sh` no longer deletes the managed block when the repository path contains a backslash or the template cannot be read, and both setup scripts require exactly one block in the template. `enable-defaults.ps1` resolves relative directories against the current PowerShell location.
+- On Linux, prompts keep working after an in-place upgrade while a server is running.
+- CI and releases build on macOS 15 runners (GitHub retires macOS 14 on 2026-11-02). Updated the yanked `clipboard-win` and documented the Linux-only D-Bus crates flagged as unmaintained.
+
 ## 0.3.0 - 2026-10-30
 
 - Added `--workspace-per-request` for shared MCP installations. Every call carries its current project directory, so new chats cannot inherit a globally pinned previous project.

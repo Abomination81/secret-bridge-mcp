@@ -7,6 +7,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+# .NET file APIs resolve relative paths against the process directory, which PowerShell does not
+# update on cd. Resolve both directories once so every check and write uses the same location.
+$CodexDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($CodexDir)
+$ClaudeDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ClaudeDir)
 $beginMarker = "<!-- secret-bridge-mcp:begin -->"
 $endMarker = "<!-- secret-bridge-mcp:end -->"
 $utf8 = New-Object System.Text.UTF8Encoding($false, $true)

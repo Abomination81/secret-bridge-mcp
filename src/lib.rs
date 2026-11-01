@@ -42,6 +42,7 @@ impl AppConfig {
         if !workspace_root.is_dir() {
             return Err("workspace root must be a directory".into());
         }
+        validate_resolved_workspace(&workspace_root)?;
 
         let data_dir = match data_dir {
             Some(path) => {
@@ -86,6 +87,7 @@ impl AppConfig {
         if !workspace_root.is_dir() {
             return Err("workspace_root must name an existing directory".into());
         }
+        validate_resolved_workspace(&workspace_root)?;
         if !self.workspace_per_request && workspace_root != self.workspace_root {
             return Err("workspace_root does not match this server's fixed workspace. Use a request-scoped SecretBridge server; do not repoint a shared server or export into a different project".into());
         }
@@ -107,6 +109,15 @@ impl AppConfig {
             client_name: "Test client".into(),
         }
     }
+}
+
+/// The resolved path becomes a dialog line and a stored grant, so it must meet the same rules as
+/// the text that was requested; a symlink could otherwise smuggle in a separator or invalid UTF-8.
+fn validate_resolved_workspace(workspace_root: &Path) -> Result<(), String> {
+    let resolved = workspace_root
+        .to_str()
+        .ok_or("workspace_root must resolve to a UTF-8 path")?;
+    crate::validation::validate_display_text("resolved workspace_root", resolved, 1, 4096, false)
 }
 
 fn default_data_dir() -> Result<PathBuf, String> {

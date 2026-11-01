@@ -51,7 +51,8 @@ Not trusted:
 - Metadata and audit records contain no values and use user-only permissions on macOS.
 - Env paths are relative, revalidated immediately before writing, confined to the request’s canonical workspace, and limited to non-template dotenv filenames.
 - Existing/parent symlinks and a symlinked `.gitignore` are rejected.
-- Git-tracked targets are refused and Git ignore status is verified before writing.
+- Git-tracked targets are refused, case-insensitively, and Git ignore status is verified before writing. If Git cannot answer (for example a broken configuration, an untrusted repository, or missing developer tools), the write is refused rather than treated as a non-repository. Inherited `GIT_*` variables are cleared for these checks.
+- Env writes are serialized across SecretBridge processes, so concurrent sessions cannot drop each other's variables. Temporary files match the `.env*` ignore rule and receive their final permissions before they become visible.
 - Existing env files and inbound JSON-RPC messages have size caps.
 - Secret variables with public client-bundle prefixes are rejected.
 - Labels reject line breaks, control characters, and Unicode bidirectional overrides.
@@ -60,6 +61,9 @@ Not trusted:
 - Cross-workspace reuse requires a one-time native grant.
 - Save & Use authorizes credential storage and subsequent env writes within the displayed workspace. Existing workspace grants have the same meaning starting in 0.2; there is no per-write approval popup.
 - Cross-workspace grants and deletions retain a native confirmation. Closing or cancelling a dialog never grants access.
+- A credential can be deleted or replaced only from a workspace where it is available; the deletion dialog names the requesting workspace and how many other workspaces use the credential.
+- Labels, descriptions, and resolved workspace paths may not contain control, directional, invisible, line-separator, or tag characters, so request text cannot push the real workspace out of a dialog. The registry refuses writes that its reads would reject.
+- If the broker exits while a popup is open, the popup closes itself and stores nothing.
 - The tool result reports names and status, never file contents.
 - `.env*` is automatically gitignored while template files remain committable and cannot receive secrets.
 - Registry writes use a lock and atomic replacement; credential/metadata creation and replacement have compensating rollback.

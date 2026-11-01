@@ -1,6 +1,6 @@
 use super::{
     Mode, PROMPT_CANCELLED_EXIT_CODE, PROMPT_FAILED_EXIT_CODE, SERVICE_NAME, SecureInputGuard,
-    ensure_entry_is_empty, vault_message,
+    credential_text, ensure_entry_is_empty, vault_message,
 };
 use eframe::egui::{
     self, Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Stroke, TextEdit,
@@ -174,7 +174,7 @@ impl SecretBridgeUi {
             .size(11.0)
             .color(MUTED),
         );
-        if self.secret.len() > 65_536 {
+        if credential_text(&self.secret).len() > 65_536 {
             ui.label(
                 RichText::new("Use a credential smaller than 64 KiB.")
                     .size(11.0)
@@ -186,7 +186,8 @@ impl SecretBridgeUi {
 
     fn actions(&mut self, ui: &mut egui::Ui, is_secret: bool) {
         let ctx = ui.ctx().clone();
-        let enabled = !is_secret || (!self.secret.is_empty() && self.secret.len() <= 65_536);
+        let credential = credential_text(&self.secret);
+        let enabled = !is_secret || (!credential.is_empty() && credential.len() <= 65_536);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let response = ui.add_enabled(
                 enabled,
@@ -281,6 +282,7 @@ impl SecretBridgeUi {
                                 client,
                                 title,
                                 message,
+                                ..
                             } => {
                                 ui.label(RichText::new(title).size(22.0).strong());
                                 ui.add_space(16.0);
@@ -351,8 +353,12 @@ impl SecretBridgeUi {
                                 "could not access the operating-system credential store".to_string()
                             })
                             .and_then(|entry| {
+                                let credential = credential_text(&secret);
+                                if credential.is_empty() || credential.len() > 65_536 {
+                                    return Err("invalid credential length".to_string());
+                                }
                                 ensure_entry_is_empty(&entry)?;
-                                entry.set_password(&secret).map_err(|_| {
+                                entry.set_password(credential).map_err(|_| {
                                     "could not store the secret in the operating-system credential store"
                                         .to_string()
                                 })?;

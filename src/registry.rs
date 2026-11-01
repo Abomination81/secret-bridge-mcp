@@ -13,6 +13,7 @@ use crate::secure_create_dir;
 const MAX_REGISTRY_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_AUDIT_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_RECORDS: usize = 10_000;
+const MAX_WORKSPACE_GRANTS: usize = 100;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SecretRecord {
@@ -80,17 +81,11 @@ impl Registry {
                 .iter_mut()
                 .find(|record| record.id == existing_id)
                 .ok_or_else(|| "existing secret metadata disappeared".to_string())?;
+            add_workspace_grant(record, workspace)?;
             record.id = new_id;
             record.label = label;
             record.description = description;
             record.suggested_env_var = suggested_env_var;
-            if !record
-                .allowed_workspaces
-                .iter()
-                .any(|item| item == workspace)
-            {
-                record.allowed_workspaces.push(workspace.to_string());
-            }
             record.updated_at = now;
             Ok(record.clone())
         })
@@ -146,12 +141,7 @@ impl Registry {
                 .iter_mut()
                 .find(|record| record.id == id)
                 .ok_or_else(|| "secret metadata disappeared".to_string())?;
-            if !record
-                .allowed_workspaces
-                .iter()
-                .any(|item| item == workspace)
-            {
-                record.allowed_workspaces.push(workspace.to_string());
+            if add_workspace_grant(record, workspace)? {
                 record.updated_at = unix_time();
             }
             Ok(record.clone())
@@ -242,6 +232,12 @@ impl Registry {
         let lock = self.lock()?;
         let mut data = self.read_data()?;
         let result = operation(&mut data)?;
+        // Hold writes to the rules every read enforces: data that fails them would make the
+        // registry unreadable for every session until it was repaired by hand.
+        if data.secrets.len() > MAX_RECORDS {
+            return Err("registry record limit reached; delete unused secrets first".into());
+        }
+        validate_registry_data(&data)?;
         self.write_data(&data)?;
         let _ = FileExt::unlock(&lock);
         Ok(result)
@@ -328,6 +324,9 @@ impl Registry {
         inspect_regular_or_missing(&final_path, "registry")?;
         let encoded = serde_json::to_vec_pretty(data)
             .map_err(|error| format!("cannot encode registry: {error}"))?;
+        if encoded.len() as u64 > MAX_REGISTRY_BYTES {
+            return Err("registry would exceed the 4 MiB safety limit".into());
+        }
         let mut options = OpenOptions::new();
         options.create(true).truncate(true).write(true);
         #[cfg(unix)]
@@ -390,6 +389,25 @@ fn replace_file_windows(final_path: &Path, replacement: &Path, kind: &str) -> Re
     Ok(())
 }
 
+/// Records `workspace` as allowed for `record`, returning whether it was newly added.
+fn add_workspace_grant(record: &mut SecretRecord, workspace: &str) -> Result<bool, String> {
+    if record
+        .allowed_workspaces
+        .iter()
+        .any(|item| item == workspace)
+    {
+        return Ok(false);
+    }
+    crate::validation::validate_display_text("workspace grant", workspace, 1, 4096, false)?;
+    if record.allowed_workspaces.len() >= MAX_WORKSPACE_GRANTS {
+        return Err(format!(
+            "this credential is already available in {MAX_WORKSPACE_GRANTS} workspaces; delete it and store it again to reset its workspace list"
+        ));
+    }
+    record.allowed_workspaces.push(workspace.to_string());
+    Ok(true)
+}
+
 fn inspect_regular_or_missing(path: &Path, kind: &str) -> Result<(), String> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
@@ -417,7 +435,7 @@ fn validate_registry_data(data: &RegistryData) -> Result<(), String> {
             crate::env_file::validate_env_name(name)
                 .map_err(|_| "registry contains an invalid environment variable".to_string())?;
         }
-        if record.allowed_workspaces.len() > 100
+        if record.allowed_workspaces.len() > MAX_WORKSPACE_GRANTS
             || record.allowed_workspaces.iter().any(|workspace| {
                 crate::validation::validate_display_text(
                     "workspace grant",
@@ -503,6 +521,67 @@ mod tests {
                 .description,
             "Original purpose"
         );
+    }
+
+    #[test]
+    fn grants_beyond_the_read_limits_are_refused_without_breaking_the_registry() {
+        let data = secure_tempdir();
+        let registry = Registry::new(data.path());
+        let record = registry
+            .insert_with_id(
+                "sb_0123456789abcdef0123456789abcdef".into(),
+                "Shared secret".into(),
+                "Used by many worktrees".into(),
+                None,
+                "/workspace/0".into(),
+            )
+            .unwrap();
+        for index in 1..MAX_WORKSPACE_GRANTS {
+            registry
+                .grant_workspace(&record.id, &format!("/workspace/{index}"))
+                .unwrap();
+        }
+        let error = registry
+            .grant_workspace(&record.id, "/workspace/overflow")
+            .unwrap_err();
+        assert!(error.contains("already available in 100 workspaces"));
+        assert!(
+            registry
+                .grant_workspace(&record.id, "/workspace/50")
+                .is_ok()
+        );
+        let spoofed = registry
+            .grant_workspace(&record.id, "/workspace/a\u{2028}b")
+            .unwrap_err();
+        assert!(spoofed.contains("workspace grant"));
+        assert_eq!(registry.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn restoring_a_duplicate_label_is_refused_instead_of_saved() {
+        let data = secure_tempdir();
+        let registry = Registry::new(data.path());
+        let original = registry
+            .insert_with_id(
+                "sb_0123456789abcdef0123456789abcdef".into(),
+                "Same label".into(),
+                "First".into(),
+                None,
+                "/workspace/one".into(),
+            )
+            .unwrap();
+        registry.delete(&original.id).unwrap();
+        registry
+            .insert_with_id(
+                "sb_fedcba9876543210fedcba9876543210".into(),
+                "Same label".into(),
+                "Second".into(),
+                None,
+                "/workspace/one".into(),
+            )
+            .unwrap();
+        assert!(registry.restore_deleted(original).is_err());
+        assert_eq!(registry.list().unwrap().len(), 1);
     }
 
     #[test]
