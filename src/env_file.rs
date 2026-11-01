@@ -193,7 +193,7 @@ fn merge_env_file(
             .and_then(|quote| {
                 lines[index + 1..]
                     .iter()
-                    .position(|continuation| closes_quote(continuation, quote))
+                    .position(|continuation| ends_quoted_value(continuation, quote))
             })
             .map_or(index, |offset| index + 1 + offset);
         if let Some(value) = replacements.get(assignment.name) {
@@ -275,6 +275,24 @@ fn closes_quote(text: &str, quote: char) -> bool {
             escaped = true;
         } else if character == quote {
             return true;
+        }
+    }
+    false
+}
+
+/// Whether `line` ends a multi-line value: its first unescaped `quote` is followed only by
+/// whitespace or a comment. A line like `OTHER="x"` opens a new value instead, so a stray
+/// backslash before a closing quote (`DIR="C:\app\"`) never swallows the lines after it.
+fn ends_quoted_value(line: &str, quote: char) -> bool {
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' && quote != '\'' {
+            escaped = true;
+        } else if character == quote {
+            let rest = line[index + character.len_utf8()..].trim_start();
+            return rest.is_empty() || rest.starts_with('#');
         }
     }
     false
@@ -732,6 +750,26 @@ mod tests {
             fs::read_to_string(&target).unwrap(),
             "TOKEN=\"new\"\nKEEP=yes\n"
         );
+    }
+
+    #[test]
+    fn a_backslash_before_a_closing_quote_never_hides_or_drops_later_lines() {
+        let temp = tempdir().unwrap();
+        let target = temp.path().join(".env");
+        for (before, after) in [
+            (
+                "ROOT_DIR=\"C:\\app\\\"\nTOKEN=old-secret\nDB_URL=\"x\"\n",
+                "ROOT_DIR=\"C:\\app\\\"\nTOKEN=\"new\"\nDB_URL=\"x\"\n",
+            ),
+            (
+                "TOKEN=\"abc\\\"\nKEEP_ME=1\nOTHER=\"y\"\nTAIL=2\n",
+                "TOKEN=\"new\"\nKEEP_ME=1\nOTHER=\"y\"\nTAIL=2\n",
+            ),
+        ] {
+            fs::write(&target, before).unwrap();
+            write_env_file(temp.path(), &target, &token("new"), &locks(&temp)).unwrap();
+            assert_eq!(fs::read_to_string(&target).unwrap(), after);
+        }
     }
 
     #[test]

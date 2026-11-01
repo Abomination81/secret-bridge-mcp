@@ -1,4 +1,4 @@
-use std::io::{BufRead, Read, Write};
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -19,8 +19,15 @@ const MAX_PROMPT_REQUEST_BYTES: u64 = 65_536;
 const PROMPT_CANCELLED_EXIT_CODE: u8 = 20;
 const PROMPT_FAILED_EXIT_CODE: i32 = 21;
 
+/// Asks the prompt to close itself if the broker that started it goes away. It travels as an
+/// argument, not in the request, so the request stays readable by older prompt binaries.
+const WATCH_PARENT_ARG: &str = "--watch-parent";
+
+// The request is the compatibility contract between brokers and prompt binaries of different
+// versions during an upgrade or rollback: keep its fields unchanged. Unknown fields are ignored
+// so that a newer broker's request can still open an older prompt.
 #[derive(Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 enum Mode {
     Secret {
         secret_id: String,
@@ -31,31 +38,18 @@ enum Mode {
         #[serde(default)]
         workspace: String,
         replacing: bool,
-        /// Set by brokers that keep the prompt's stdin open until it exits.
-        #[serde(default)]
-        watch_parent: bool,
     },
     Confirm {
         client: String,
         title: String,
         message: String,
-        #[serde(default)]
-        watch_parent: bool,
     },
 }
 
-impl Mode {
-    fn watch_parent(&self) -> bool {
-        match self {
-            Mode::Secret { watch_parent, .. } | Mode::Confirm { watch_parent, .. } => *watch_parent,
-        }
-    }
-}
-
-/// The credential to store from what the field holds. Pasted keys often carry a trailing
-/// newline or stray spaces, and none of that belongs to the credential.
+/// The credential to store from what the field holds. A pasted key often carries a line break
+/// at the end; other characters, including spaces, may belong to a password and are kept.
 fn credential_text(value: &str) -> &str {
-    value.trim()
+    value.trim_matches(['\r', '\n'])
 }
 
 fn validate_ui_text(
@@ -124,7 +118,6 @@ pub(crate) fn prompt_and_store_secret(
         env_var: env_var.map(str::to_string),
         workspace: workspace.to_string(),
         replacing,
-        watch_parent: true,
     })
 }
 
@@ -136,7 +129,6 @@ pub(crate) fn confirm(client: &str, title: &str, message: &str) -> Result<bool, 
         client: client.to_string(),
         title: title.to_string(),
         message: message.to_string(),
-        watch_parent: true,
     })
 }
 
@@ -158,6 +150,7 @@ fn run_prompt_process(mode: Mode) -> Result<bool, String> {
     let mut command = Command::new(executable);
     command
         .arg("--native-prompt")
+        .arg(WATCH_PARENT_ARG)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -174,24 +167,21 @@ fn run_prompt_process(mode: Mode) -> Result<bool, String> {
         .spawn()
         .map_err(|error| format!("cannot start the native prompt: {error}"))?;
 
-    let mut input = child.stdin.take();
-    let write_result = input
-        .as_mut()
+    // Send the request and close stdin: prompt binaries of every version read it to EOF.
+    let write_result = child
+        .stdin
+        .take()
         .ok_or_else(|| "native prompt input is unavailable".to_string())
-        .and_then(|input| {
-            serde_json::to_writer(&mut *input, &mode)
+        .and_then(|mut input| {
+            serde_json::to_writer(&mut input, &mode)
                 .map_err(|error| format!("cannot encode native prompt request: {error}"))?;
             input
-                .write_all(b"\n")
-                .and_then(|()| input.flush())
+                .flush()
                 .map_err(|error| format!("cannot send native prompt request: {error}"))
         });
-    // Hold stdin open while the prompt runs. If this broker dies, the pipe closes and the
-    // prompt closes itself instead of storing a credential that no client will receive.
     let status = child
         .wait()
         .map_err(|error| format!("cannot wait for the native prompt: {error}"))?;
-    drop(input);
     write_result?;
 
     match status.code() {
@@ -221,22 +211,24 @@ pub fn run_desktop(config: AppConfig) -> Result<(), String> {
 }
 
 pub fn run_native_prompt_child() -> Result<u8, String> {
-    // Current brokers end the request with a newline and keep the pipe open; older ones send
-    // the request alone and close it. Reading to the first newline handles both.
+    // Brokers before 0.4 do not pass the flag; their prompts behave as they always did.
+    if std::env::args_os()
+        .skip(2)
+        .any(|arg| arg == WATCH_PARENT_ARG)
+    {
+        exit_when_broker_exits();
+    }
     let mut encoded = Vec::new();
     std::io::stdin()
         .lock()
         .take(MAX_PROMPT_REQUEST_BYTES + 1)
-        .read_until(b'\n', &mut encoded)
+        .read_to_end(&mut encoded)
         .map_err(|error| format!("cannot read native prompt request: {error}"))?;
     if encoded.len() as u64 > MAX_PROMPT_REQUEST_BYTES {
         return Err("native prompt request is too large".into());
     }
     let mode: Mode = serde_json::from_slice(&encoded)
         .map_err(|error| format!("invalid native prompt request: {error}"))?;
-    if mode.watch_parent() {
-        exit_when_broker_exits();
-    }
 
     let secure_input = match &mode {
         Mode::Secret {
@@ -271,7 +263,8 @@ pub fn run_native_prompt_child() -> Result<u8, String> {
         } => {
             validate_ui_text("client", client, 1, 80, false)?;
             validate_ui_text("title", title, 1, 80, false)?;
-            validate_ui_text("message", message, 1, 12_000, true)?;
+            // Confirmations quote stored labels, which may predate the stricter input rules.
+            crate::validation::validate_stored_text("message", message, 1, 12_000, true)?;
             None
         }
     };
@@ -287,26 +280,28 @@ pub fn run_native_prompt_child() -> Result<u8, String> {
     }
 }
 
-/// The broker holds this process's stdin open until the prompt exits, so end-of-file means it
-/// is gone. Close the prompt then: a credential saved now would be stored under an ID that no
-/// client receives, and the dialog would float with nothing waiting for its answer.
+/// Closes the prompt when the broker that started it exits. A credential saved after that would
+/// be stored under an ID no client receives, and the dialog would float with nothing waiting
+/// for its answer. When the broker dies this process is re-parented, so its parent ID changes.
+#[cfg(unix)]
 fn exit_when_broker_exits() {
+    // SAFETY: getppid has no preconditions and cannot fail.
+    let broker = unsafe { libc::getppid() };
     let _ = thread::Builder::new()
         .name("secret-bridge-broker-watch".into())
-        .spawn(|| {
-            let mut stdin = std::io::stdin();
-            let mut discard = [0u8; 64];
-            loop {
-                match stdin.read(&mut discard) {
-                    Ok(0) => break,
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(_) => break,
-                }
+        .spawn(move || {
+            // A broker is never PID 1, so that parent means it exited before this check.
+            // SAFETY: as above.
+            while broker != 1 && unsafe { libc::getppid() } == broker {
+                thread::sleep(std::time::Duration::from_millis(250));
             }
             std::process::exit(i32::from(PROMPT_CANCELLED_EXIT_CODE));
         });
 }
+
+/// Windows prompts keep the earlier behavior and close only on the user's answer.
+#[cfg(not(unix))]
+fn exit_when_broker_exits() {}
 
 #[cfg(target_os = "macos")]
 struct SecureInputGuard(bool);
@@ -371,7 +366,6 @@ mod tests {
             env_var: Some("TEST_CREDENTIAL".into()),
             workspace: "/test/workspace".into(),
             replacing: false,
-            watch_parent: true,
         };
         let encoded = serde_json::to_value(mode).expect("serialize prompt metadata");
         let object = encoded.as_object().expect("prompt request object");
@@ -385,26 +379,63 @@ mod tests {
         assert!(!object.contains_key("password"));
     }
     #[test]
-    fn pasted_line_endings_and_padding_are_not_part_of_the_credential() {
+    fn pasted_line_breaks_are_not_part_of_the_credential_but_spaces_are() {
         assert_eq!(credential_text("sk-abc\n"), "sk-abc");
-        assert_eq!(credential_text("  sk-abc \r\n"), "sk-abc");
-        assert_eq!(credential_text("in ner"), "in ner");
-        assert!(credential_text("\n\t ").is_empty());
+        assert_eq!(credential_text("\r\nsk-abc\r\n"), "sk-abc");
+        assert_eq!(credential_text(" pass word "), " pass word ");
+        assert!(credential_text("\n\r\n").is_empty());
     }
 
     #[test]
-    fn only_current_brokers_ask_the_prompt_to_watch_for_them() {
-        let current: Mode = serde_json::from_value(serde_json::json!({
-            "kind": "confirm", "client": "Client", "title": "Delete secret",
-            "message": "Message", "watch_parent": true
+    fn requests_stay_readable_by_older_and_newer_prompts() {
+        // A 0.3 prompt rejects unknown fields, so a request may only use the fields it knew.
+        let secret = serde_json::to_value(Mode::Secret {
+            secret_id: "sb_0123456789abcdef0123456789abcdef".into(),
+            client: "Client".into(),
+            label: "Label".into(),
+            description: "Description".into(),
+            env_var: None,
+            workspace: "/workspace".into(),
+            replacing: false,
+        })
+        .unwrap();
+        let confirm = serde_json::to_value(Mode::Confirm {
+            client: "Client".into(),
+            title: "Title".into(),
+            message: "Message".into(),
+        })
+        .unwrap();
+        for (request, known) in [
+            (
+                &secret,
+                &[
+                    "kind",
+                    "secret_id",
+                    "client",
+                    "label",
+                    "description",
+                    "env_var",
+                    "workspace",
+                    "replacing",
+                ][..],
+            ),
+            (&confirm, &["kind", "client", "title", "message"][..]),
+        ] {
+            assert!(
+                request
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .all(|key| known.contains(&key.as_str()))
+            );
+        }
+        // A future broker's extra field must not stop this prompt from opening.
+        let newer: Mode = serde_json::from_value(serde_json::json!({
+            "kind": "confirm", "client": "Client", "title": "Title", "message": "Message",
+            "added_later": true
         }))
         .unwrap();
-        assert!(current.watch_parent());
-        let older: Mode = serde_json::from_value(serde_json::json!({
-            "kind": "confirm", "client": "Client", "title": "Delete secret", "message": "Message"
-        }))
-        .unwrap();
-        assert!(!older.watch_parent());
+        assert!(matches!(newer, Mode::Confirm { .. }));
     }
 
     #[test]

@@ -120,17 +120,47 @@ fn app_icon(side: f64) -> Retained<NSImage> {
     NSImage::imageWithSize_flipped_drawingHandler(NSSize::new(side, side), true, &draw)
 }
 
-/// macOS 26 lays alerts out flush with the leading edge; earlier releases center them.
-fn alert_alignment() -> NSTextAlignment {
-    if NSProcessInfo::processInfo()
-        .operatingSystemVersion()
-        .majorVersion
-        >= 26
+const ALIGNMENT_PROBE: &str = "SecretBridge layout probe";
+
+/// How this system aligns alert text: flush with the leading edge on macOS 26 with its SDK,
+/// centered on earlier releases and for older SDKs. Read from a throwaway alert's own title so
+/// the accessory always matches the alert around it, with the OS version as a fallback.
+fn alert_alignment(mtm: MainThreadMarker) -> NSTextAlignment {
+    let probe = NSAlert::new(mtm);
+    probe.setMessageText(&NSString::from_str(ALIGNMENT_PROBE));
+    probe.layout();
+    let centered = match probe
+        .window()
+        .contentView()
+        .and_then(|view| probe_title_alignment(&view))
     {
-        NSTextAlignment::Natural
-    } else {
+        Some(alignment) => alignment == NSTextAlignment::Center,
+        None => {
+            NSProcessInfo::processInfo()
+                .operatingSystemVersion()
+                .majorVersion
+                < 26
+        }
+    };
+    if centered {
         NSTextAlignment::Center
+    } else {
+        NSTextAlignment::Natural
     }
+}
+
+fn probe_title_alignment(view: &NSView) -> Option<NSTextAlignment> {
+    for subview in view.subviews().iter() {
+        if let Some(field) = subview.downcast_ref::<NSTextField>()
+            && field.stringValue().to_string() == ALIGNMENT_PROBE
+        {
+            return Some(field.alignment());
+        }
+        if let Some(alignment) = probe_title_alignment(&subview) {
+            return Some(alignment);
+        }
+    }
+    None
 }
 
 fn single_line(
@@ -393,7 +423,7 @@ pub(super) fn run(mode: Mode, secure_input: Option<SecureInputGuard>) -> Result<
     unsafe {
         alert.setIcon(Some(&icon));
     }
-    let alignment = alert_alignment();
+    let alignment = alert_alignment(mtm);
     let is_secret = matches!(mode, Mode::Secret { .. });
     let legacy = matches!(&mode, Mode::Secret { workspace, .. } if workspace.is_empty());
     let submit = alert.addButtonWithTitle(if legacy {

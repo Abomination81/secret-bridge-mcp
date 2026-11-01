@@ -155,7 +155,18 @@ pub(crate) fn secure_create_dir(path: &Path) -> Result<(), String> {
             return Err("data directory must be a real directory, not a symlink".into());
         }
     }
-    fs::create_dir_all(path).map_err(|error| format!("cannot create data directory: {error}"))?;
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    // Create it private from the start: a directory created open and narrowed afterwards could
+    // be seen in between by a concurrent caller, which would then refuse it as shared.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(path)
+        .map_err(|error| format!("cannot create data directory: {error}"))?;
 
     #[cfg(unix)]
     {

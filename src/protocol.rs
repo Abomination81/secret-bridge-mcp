@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::env_file::{EnvValue, resolve_env_path, validate_env_name, write_env_file};
-use crate::registry::{Registry, SecretRecord};
+use crate::registry::{MAX_WORKSPACE_GRANTS, Registry, SecretRecord};
 use crate::{AppConfig, SERVICE_NAME, ui};
 
 const SUPPORTED_PROTOCOLS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -313,7 +313,7 @@ fn secret_request(
         // Replacing changes the value every granted workspace receives, so it must come from a
         // workspace that already has access.
         return Err(format!(
-            "\"{}\" is stored for another workspace. Request it without replace_existing first so the user can allow this workspace, then replace it.",
+            "\"{}\" is stored for another workspace. Request it without replace_existing first so the user can allow this workspace, then replace it. If its stored value is missing, delete it with secret_delete and request it again.",
             record.label
         ));
     }
@@ -328,6 +328,14 @@ fn secret_request(
                 let record = if available_in_workspace(record, config) {
                     record.clone()
                 } else {
+                    // Refuse before asking: an approved grant that could not be saved would
+                    // leave the user with a dialog that did nothing.
+                    if record.allowed_workspaces.len() >= MAX_WORKSPACE_GRANTS {
+                        return Err(format!(
+                            "\"{}\" is already available in {MAX_WORKSPACE_GRANTS} workspaces. Use it from one of those, or delete it with secret_delete and store it again.",
+                            record.label
+                        ));
+                    }
                     let message = format!(
                         "Allow this stored secret in another workspace?\n\nLabel: {}\nWorkspace: {}\n\nThis allows future .env writes in this workspace without another prompt. Those files are readable by local processes with filesystem access.",
                         record.label,
@@ -351,8 +359,11 @@ fn secret_request(
                     audit_recorded,
                 );
             }
-            Err(keyring::Error::NoEntry) => {
+            Err(keyring::Error::NoEntry) if available_in_workspace(record, config) => {
                 return Err("stored secret metadata exists but its credential is unavailable; retry with replace_existing=true".into());
+            }
+            Err(keyring::Error::NoEntry) => {
+                return Err("stored secret metadata exists but its credential is unavailable; delete it with secret_delete, then request it again".into());
             }
             Err(_) => {
                 return Err("the operating-system credential store could not be read".into());
@@ -652,22 +663,26 @@ fn secret_delete(
     let record = registry
         .find_by_id(&args.secret_id)?
         .ok_or_else(|| format!("unknown secret_id: {}", args.secret_id))?;
-    if !available_in_workspace(&record, config) {
-        return Err(format!(
-            "secret_id {} is not available in this workspace; delete it from a workspace where it is available",
-            record.id
-        ));
-    }
-    let shared = record.allowed_workspaces.len().saturating_sub(1);
+    // Deletion works from any workspace, so a credential whose workspaces are gone can still be
+    // removed. The confirmation says where the request comes from and who else uses it.
+    let available = available_in_workspace(&record, config);
+    let others = record
+        .allowed_workspaces
+        .len()
+        .saturating_sub(usize::from(available));
     let message = format!(
-        "Permanently delete this stored credential?\n\nLabel: {}\nSecret ID: {}\nRequested from: {}{}\n\nExisting .env files will not be changed.",
+        "Permanently delete this stored credential?\n\nLabel: {}\nSecret ID: {}\nRequested from: {}\n{}\n\nExisting .env files will not be changed.",
         record.label,
         record.id,
         config.workspace_root.display(),
-        match shared {
-            0 => String::new(),
-            1 => "\nAlso used by 1 other workspace.".into(),
-            count => format!("\nAlso used by {count} other workspaces."),
+        match (available, others) {
+            (true, 0) => "Used only by this workspace.".to_string(),
+            (true, 1) => "Also used by 1 other workspace.".to_string(),
+            (true, count) => format!("Also used by {count} other workspaces."),
+            (false, 1) => "Not used by this workspace; used by 1 other workspace.".to_string(),
+            (false, count) => {
+                format!("Not used by this workspace; used by {count} other workspaces.")
+            }
         }
     );
     interaction_gate.check()?;
@@ -1275,7 +1290,19 @@ mod tests {
         let data = tempdir().unwrap();
         let config = AppConfig::for_test(workspace.path(), &data.path().join("private"));
         let registry = Registry::new(&config.data_dir);
+        let secret_id = "sb_0123456789abcdef0123456789abcdef";
+        registry
+            .insert_with_id(
+                secret_id.into(),
+                "Elsewhere".into(),
+                "Granted to another workspace".into(),
+                None,
+                "/another/workspace".into(),
+            )
+            .unwrap();
         let mut gate = InteractionGate::default();
+        // Each call parses, resolves its mapping, and is refused at authorization: the furthest
+        // env_write gets without reading the keychain. None of it opens a popup.
         for id in 0..(MAX_INTERACTIVE_REQUESTS_PER_MINUTE + 2) {
             let response = handle_message(
                 &config,
@@ -1283,17 +1310,24 @@ mod tests {
                 &mut gate,
                 json!({
                     "jsonrpc": "2.0", "id": id, "method": "tools/call",
-                    "params": { "name": "env_write", "arguments": { "path": ".env", "entries": [] } }
+                    "params": { "name": "env_write", "arguments": {
+                        "path": ".env", "entries": [{ "name": "TOKEN", "secret_id": secret_id }]
+                    } }
                 }),
             )
             .unwrap();
-            assert_eq!(response["result"]["isError"], true);
+            assert!(
+                response["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not authorized for this workspace")
+            );
         }
         assert!(gate.recent.is_empty());
     }
 
     #[test]
-    fn other_workspaces_credentials_cannot_be_deleted_or_replaced_from_here() {
+    fn other_workspaces_credentials_cannot_be_replaced_from_here() {
         let workspace = tempdir().unwrap();
         let other = tempdir().unwrap();
         let data = tempdir().unwrap();
@@ -1310,9 +1344,6 @@ mod tests {
             )
             .unwrap();
         let mut gate = InteractionGate::default();
-        let delete =
-            secret_delete(&config, &registry, &mut gate, json!({ "secret_id": id })).unwrap_err();
-        assert!(delete.contains("not available in this workspace"));
         let replace = secret_request(
             &config,
             &registry,

@@ -61,9 +61,9 @@ Not trusted:
 - Cross-workspace reuse requires a one-time native grant.
 - Save & Use authorizes credential storage and subsequent env writes within the displayed workspace. Existing workspace grants have the same meaning starting in 0.2; there is no per-write approval popup.
 - Cross-workspace grants and deletions retain a native confirmation. Closing or cancelling a dialog never grants access.
-- A credential can be deleted or replaced only from a workspace where it is available; the deletion dialog names the requesting workspace and how many other workspaces use the credential.
-- Labels, descriptions, and resolved workspace paths may not contain control, directional, invisible, line-separator, or tag characters, so request text cannot push the real workspace out of a dialog. The registry refuses writes that its reads would reject.
-- If the broker exits while a popup is open, the popup closes itself and stores nothing.
+- A credential can be replaced only from a workspace where it is available. Deletion works from any workspace; its confirmation names the requesting workspace and how many workspaces use the credential.
+- New labels, descriptions, and resolved workspace paths may not contain control, directional, invisible, line-separator, or tag characters, so request text cannot push the real workspace out of a dialog. Records written by earlier releases are read under the rules they were written with. The registry refuses writes that its reads would reject.
+- On macOS and Linux, if the broker exits while a popup is open, the popup closes itself and stores nothing.
 - The tool result reports names and status, never file contents.
 - `.env*` is automatically gitignored while template files remain committable and cannot receive secrets.
 - Registry writes use a lock and atomic replacement; credential/metadata creation and replacement have compensating rollback.

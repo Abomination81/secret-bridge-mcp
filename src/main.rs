@@ -67,9 +67,15 @@ fn parse_args() -> Result<AppConfig, String> {
         return Err("--workspace-per-request cannot be combined with --workspace-root".into());
     }
     if workspace_per_request {
-        // Every call names its own workspace, so the launch directory is never used and may
-        // already be gone (for example a removed worktree).
-        workspace_root = Some(env::temp_dir());
+        // Every call names its own workspace, so this placeholder is never used. Pick one that
+        // exists: the launch directory may already be gone (for example a removed worktree).
+        workspace_root = [
+            env::temp_dir(),
+            env::var_os("HOME").map(PathBuf::from).unwrap_or_default(),
+        ]
+        .into_iter()
+        .find(|candidate| candidate.is_dir())
+        .or_else(|| Some(PathBuf::from(std::path::MAIN_SEPARATOR_STR)));
     }
     let mut config = AppConfig::new_with_data_dir(workspace_root, client_name, data_dir)?;
     config.workspace_per_request = workspace_per_request;

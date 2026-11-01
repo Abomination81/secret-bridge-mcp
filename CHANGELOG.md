@@ -8,17 +8,17 @@ All notable changes to SecretBridge are documented here.
 
 - Redesigned the credential popup: the SecretBridge app icon replaces the gray lock, request details sit in smaller secondary text, the field uses the standard large control size, and a recessed well shows the authorized folder's name with its full location beneath it. The storage note leads with a lock when it fits on one line.
 - The popup follows the system light or dark appearance and keeps its window shadow. Alignment follows the system alert style: flush left on macOS 26, centered on earlier releases.
-- Leading and trailing whitespace is no longer stored as part of a credential, so a pasted key with a trailing newline works. This applies to the Windows popup too.
-- If the MCP server exits while a popup is open, the popup now closes and stores nothing, instead of saving a credential no client would receive.
+- A line break at the start or end of an entered credential, such as the one a copied key often carries, is no longer stored. Spaces are kept, since they may belong to a password.
+- On macOS and Linux, if the MCP server exits while a popup is open, the popup now closes and stores nothing, instead of saving a credential no client would receive. The request format between server and popup is unchanged, so servers and popups from 0.3 and 0.4 work with each other during an upgrade or rollback.
 
 ### Safety fixes
 
-- The registry now refuses writes that its reads would reject. Previously a 101st workspace grant, or a workspace path with an invisible character reached through a symlink, saved successfully and then made the registry unreadable for every session.
-- Labels, descriptions, and workspace paths reject Unicode line and paragraph separators and invisible tag characters, which could push the real workspace out of view in a dialog. Resolved workspace paths are validated too and must be UTF-8.
-- A credential can be deleted, or replaced with `replace_existing`, only from a workspace where it is available. The deletion dialog now names the requesting workspace.
+- The registry now refuses writes that its reads would reject. Previously a 101st workspace grant, or a workspace path with an invisible character reached through a symlink, saved successfully and then made the registry unreadable for every session. The grant limit is now checked before the grant dialog appears.
+- New labels, descriptions, and workspace paths reject Unicode line and paragraph separators and invisible tag characters, which could push the real workspace out of view in a dialog. Resolved workspace paths are validated too and must be UTF-8. Records stored by earlier releases are still read under the earlier rules.
+- `replace_existing` works only from a workspace where the credential is available. Deletion still works from any workspace, and its confirmation now names the requesting workspace and how many workspaces use the credential.
 - Env writes refuse when Git cannot verify the target (for example a broken config or an untrusted repository) instead of skipping the tracked and ignored checks. Inherited `GIT_*` variables are cleared, and the tracked-file check is case-insensitive, so `.env.PRODUCTION` no longer bypasses a committed `.env.production`. Template names are matched case-insensitively too.
 - Concurrent env writes from different sessions are serialized and no longer lose each other's variables.
-- Replacing a variable whose old value spans several quoted lines now removes every line of the old value. A byte-order mark, CRLF line endings, and `export` prefixes are preserved.
+- Replacing a variable whose old value spans several quoted lines now removes every line of the old value. A later line ends such a value only when nothing but whitespace or a comment follows its closing quote, so a stray backslash before a quote cannot hide or remove the lines after it. A byte-order mark, CRLF line endings, and `export` prefixes are preserved.
 - Temporary files are named `.env.secretbridge.*` so the `.env*` ignore rule covers any left behind by a crash, get their final permissions before they become visible, and are removed on Windows write errors.
 
 ### Protocol

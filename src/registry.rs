@@ -13,7 +13,7 @@ use crate::secure_create_dir;
 const MAX_REGISTRY_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_AUDIT_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_RECORDS: usize = 10_000;
-const MAX_WORKSPACE_GRANTS: usize = 100;
+pub(crate) const MAX_WORKSPACE_GRANTS: usize = 100;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SecretRecord {
@@ -419,6 +419,8 @@ fn inspect_regular_or_missing(path: &Path, kind: &str) -> Result<(), String> {
     }
 }
 
+/// Checks the whole registry with the rules of the release that wrote each record. New input is
+/// held to the stricter rules where it enters (requests, grants, and resolved workspaces).
 fn validate_registry_data(data: &RegistryData) -> Result<(), String> {
     let mut ids = HashSet::new();
     let mut labels = HashSet::new();
@@ -437,7 +439,7 @@ fn validate_registry_data(data: &RegistryData) -> Result<(), String> {
         }
         if record.allowed_workspaces.len() > MAX_WORKSPACE_GRANTS
             || record.allowed_workspaces.iter().any(|workspace| {
-                crate::validation::validate_display_text(
+                crate::validation::validate_stored_text(
                     "workspace grant",
                     workspace,
                     1,
@@ -460,7 +462,7 @@ fn validate_metadata_text(
     max: usize,
     allow_newlines: bool,
 ) -> Result<(), String> {
-    crate::validation::validate_display_text(name, value, min, max, allow_newlines)
+    crate::validation::validate_stored_text(name, value, min, max, allow_newlines)
         .map_err(|error| format!("registry contains invalid metadata: {error}"))
 }
 
