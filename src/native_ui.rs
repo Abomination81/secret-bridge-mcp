@@ -1,7 +1,6 @@
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::thread;
 
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
@@ -285,6 +284,8 @@ pub fn run_native_prompt_child() -> Result<u8, String> {
 /// for its answer. When the broker dies this process is re-parented, so its parent ID changes.
 #[cfg(unix)]
 fn exit_when_broker_exits() {
+    use std::thread;
+
     // SAFETY: getppid has no preconditions and cannot fail.
     let broker = unsafe { libc::getppid() };
     let _ = thread::Builder::new()

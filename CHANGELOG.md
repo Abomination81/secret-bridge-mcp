@@ -2,7 +2,7 @@
 
 All notable changes to SecretBridge are documented here.
 
-## 0.4.0 - 2026-11-01
+## 0.4.0 - 2026-11-09
 
 ### macOS popup
 
