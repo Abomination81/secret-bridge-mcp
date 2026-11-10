@@ -16,6 +16,7 @@ pub const SERVICE_NAME: &str = "dev.secretbridge.mcp";
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub workspace_root: PathBuf,
+    pub workspace_per_request: bool,
     pub data_dir: PathBuf,
     pub client_name: String,
 }
@@ -41,6 +42,7 @@ impl AppConfig {
         if !workspace_root.is_dir() {
             return Err("workspace root must be a directory".into());
         }
+        validate_resolved_workspace(&workspace_root)?;
 
         let data_dir = match data_dir {
             Some(path) => {
@@ -61,8 +63,40 @@ impl AppConfig {
 
         Ok(Self {
             workspace_root,
+            workspace_per_request: false,
             data_dir,
             client_name,
+        })
+    }
+
+    pub(crate) fn for_workspace_request(&self, requested: Option<&str>) -> Result<Self, String> {
+        let Some(requested) = requested else {
+            if self.workspace_per_request {
+                return Err("workspace_root is required on every call: use the current task's actual project directory, not a previous chat or the server's working directory".into());
+            }
+            return Ok(self.clone());
+        };
+        crate::validation::validate_display_text("workspace_root", requested, 1, 4096, false)?;
+        let requested = Path::new(requested);
+        if !requested.is_absolute() {
+            return Err("workspace_root must be an absolute path to the current project".into());
+        }
+        let workspace_root = requested
+            .canonicalize()
+            .map_err(|_| "workspace_root must name an existing directory")?;
+        if !workspace_root.is_dir() {
+            return Err("workspace_root must name an existing directory".into());
+        }
+        validate_resolved_workspace(&workspace_root)?;
+        if !self.workspace_per_request && workspace_root != self.workspace_root {
+            return Err("workspace_root does not match this server's fixed workspace. Use a request-scoped SecretBridge server; do not repoint a shared server or export into a different project".into());
+        }
+        // A call owns this immutable snapshot. Never update a shared 'current workspace'.
+        Ok(Self {
+            workspace_root,
+            workspace_per_request: false,
+            data_dir: self.data_dir.clone(),
+            client_name: self.client_name.clone(),
         })
     }
 
@@ -70,10 +104,20 @@ impl AppConfig {
     pub(crate) fn for_test(workspace_root: &Path, data_dir: &Path) -> Self {
         Self {
             workspace_root: workspace_root.to_path_buf(),
+            workspace_per_request: false,
             data_dir: data_dir.to_path_buf(),
             client_name: "Test client".into(),
         }
     }
+}
+
+/// The resolved path becomes a dialog line and a stored grant, so it must meet the same rules as
+/// the text that was requested; a symlink could otherwise smuggle in a separator or invalid UTF-8.
+fn validate_resolved_workspace(workspace_root: &Path) -> Result<(), String> {
+    let resolved = workspace_root
+        .to_str()
+        .ok_or("workspace_root must resolve to a UTF-8 path")?;
+    crate::validation::validate_display_text("resolved workspace_root", resolved, 1, 4096, false)
 }
 
 fn default_data_dir() -> Result<PathBuf, String> {
@@ -111,7 +155,18 @@ pub(crate) fn secure_create_dir(path: &Path) -> Result<(), String> {
             return Err("data directory must be a real directory, not a symlink".into());
         }
     }
-    fs::create_dir_all(path).map_err(|error| format!("cannot create data directory: {error}"))?;
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    // Create it private from the start: a directory created open and narrowed afterwards could
+    // be seen in between by a concurrent caller, which would then refuse it as shared.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(path)
+        .map_err(|error| format!("cannot create data directory: {error}"))?;
 
     #[cfg(unix)]
     {

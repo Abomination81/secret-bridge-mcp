@@ -36,7 +36,7 @@
       <div class="hero-copy">
         <p class="eyebrow"><span class="status-dot"></span> Local MCP secret broker</p>
         <h1>Give your AI a button.<br><span>Not your secret.</span></h1>
-        <p class="lede">SecretBridge opens a native popup when an AI needs an API key or credential. You paste it there, reuse it later, and approve direct <code>.env</code> writes—without putting the value in chat.</p>
+        <p class="lede">SecretBridge opens a native popup when an AI needs an API key or credential. You paste it there, reuse it later, and authorize direct <code>.env</code> writes in your workspace—without putting the value in chat.</p>
         <div class="actions">
           <a class="button primary" href="https://github.com/Abomination81/secret-bridge-mcp/releases/tag/v0.1.5">Download v0.1.5</a>
           <a class="button" href="#install">Build from source</a>
@@ -50,17 +50,16 @@
       </div>
 
       <div class="popup-preview" aria-label="Preview of the SecretBridge native popup">
-        <div class="preview-topline"><span><i></i> SECRETBRIDGE</span><b>×</b></div>
-        <h2>Secure secret entry</h2>
-        <p class="preview-muted">The value stays on this device and out of AI messages</p>
-        <div class="requester"><i></i><span>Codex</span><small>Local requester</small></div>
-        <label>SECRET</label>
-        <strong>Polymarket API credential</strong>
-        <p class="preview-muted">Used for local order execution</p>
+        <div class="preview-topline"><span>SecretBridge</span><b>×</b></div>
+        <h2>Example API key</h2>
+        <p class="preview-muted">Connect your project to the API.</p>
+        <label>Workspace</label>
+        <p class="preview-muted">~/Projects/my-app</p>
+        <p class="preview-muted">Save &amp; Use allows .env writes in this workspace without another prompt.</p>
+        <label>API key or password</label>
         <div class="secret-field">••••••••••••••••</div>
-        <p class="vault-line"><i></i> Will be stored in macOS Keychain</p>
-        <button type="button" tabindex="-1">Store secret securely</button>
-        <p class="preview-footer">Built by <a href="https://github.com/Abomination81">Abomination81</a> · <a href="https://x.com/Abomination81">X @Abomination81</a></p>
+        <p class="vault-line">Saved in macOS Keychain. Never sent to chat.</p>
+        <button type="button" tabindex="-1">Save &amp; Use</button>
       </div>
     </section>
 
@@ -74,7 +73,7 @@
         <article><span>01</span><div class="flow-icon">AI</div><h3>AI requests it</h3><p>The client sends a label, purpose, and suggested variable name—never the value.</p></article>
         <article><span>02</span><div class="flow-icon">⌨</div><h3>You enter it</h3><p>A labeled native popup collects the secret in a masked field.</p></article>
         <article><span>03</span><div class="flow-icon">⌑</div><h3>Your OS stores it</h3><p>macOS Keychain or Windows Credential Manager keeps it available for reuse.</p></article>
-        <article><span>04</span><div class="flow-icon">.env</div><h3>You approve the write</h3><p>SecretBridge writes the chosen variable directly and reports only success.</p></article>
+        <article><span>04</span><div class="flow-icon">.env</div><h3>Save &amp; Use</h3><p>Your submission authorizes writes in the displayed workspace, with no second popup.</p></article>
       </div>
     </section>
 
@@ -88,7 +87,7 @@
         <li><b>Native masked entry</b><span>The value never becomes an MCP argument.</span></li>
         <li><b>Reusable credentials</b><span>Ask for the same labeled secret in future sessions.</span></li>
         <li><b>Explicit completion receipt</b><span>The AI knows when you clicked save and can continue.</span></li>
-        <li><b>Workspace-scoped writes</b><span>Every destination and variable mapping is shown for approval.</span></li>
+        <li><b>Workspace-scoped writes</b><span>Save &amp; Use authorizes one workspace. Every file path and variable name is checked.</span></li>
         <li><b>Local-only design</b><span>No hosted service, account, analytics, or network listener.</span></li>
       </ul>
     </section>
@@ -126,12 +125,12 @@
       <div class="client-grid">
         <article><h3>Codex</h3><pre><code>codex mcp add secret-bridge -- \
   /absolute/path/secret-bridge-mcp \
-  --workspace-root /path/to/project \
+  --workspace-per-request \
   --client-name Codex</code></pre></article>
         <article><h3>Claude Code</h3><pre><code>claude mcp add --scope user \
   --transport stdio secret-bridge -- \
   /absolute/path/secret-bridge-mcp \
-  --workspace-root /path/to/project \
+  --workspace-per-request \
   --client-name "Claude Code"</code></pre></article>
       </div>
       <p class="compatibility">Make it automatic for Codex and Claude Code: after connecting, run <code>sh ./scripts/enable-defaults.sh both</code> on macOS or <code>.\scripts\enable-defaults.ps1 both</code> in Windows PowerShell from your checkout, then start a new session. This adds a persistent preference to use SecretBridge whenever a credential is needed. Existing tool permissions and popup approvals still apply.</p>
@@ -140,7 +139,7 @@
 
     <section id="boundary" class="section boundary">
       <div class="boundary-mark">!</div>
-      <div><p class="eyebrow">The honest boundary</p><h2>Out of the conversation—not invisible on disk.</h2><p>SecretBridge keeps values out of AI messages, MCP payloads, logs, and command history during collection and reuse. Once you approve an <code>.env</code> write, that file is normal local plaintext and can be read by software with filesystem access.</p><p><a href="https://github.com/Abomination81/secret-bridge-mcp/blob/main/SECURITY.md">Read the complete security model →</a></p></div>
+      <div><p class="eyebrow">The honest boundary</p><h2>Out of the conversation—not invisible on disk.</h2><p>SecretBridge keeps values out of AI messages, MCP payloads, logs, and command history during collection and reuse. Once a credential is written into an authorized workspace’s <code>.env</code> file, that file is normal local plaintext and can be read by software with filesystem access.</p><p><a href="https://github.com/Abomination81/secret-bridge-mcp/blob/main/SECURITY.md">Read the complete security model →</a></p></div>
     </section>
 
     <section class="cta section">

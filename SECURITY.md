@@ -8,7 +8,7 @@ Security fixes are provided for the latest tagged release. Upgrade before report
 
 SecretBridge is designed to prevent the common failure mode where a person pastes a credential into an AI conversation, terminal transcript, tool argument, or MCP result. The broker launches a one-shot prompt from its own executable. Only validated display metadata enters that process; the secret is entered and stored directly into the OS credential facility there and is never serialized back to the broker.
 
-SecretBridge trusts the local user account and operating system. It is not an endpoint-security or malware-detection product. Once a user approves writing a `.env` file, that file is intentionally ordinary local plaintext.
+SecretBridge trusts the local user account and operating system. It is not an endpoint-security or malware-detection product. Once a user authorizes a workspace with Save & Use and a `.env` file is written, that file is intentionally ordinary local plaintext.
 
 The model may know:
 
@@ -49,14 +49,21 @@ Not trusted:
 - Values are stored by the OS credential facility under service `dev.secretbridge.mcp`.
 - In-memory secret strings use best-effort zeroization after use.
 - Metadata and audit records contain no values and use user-only permissions on macOS.
-- Env paths are relative, revalidated after approval, confined to one canonical workspace, and limited to non-template dotenv filenames.
+- Env paths are relative, revalidated immediately before writing, confined to the request’s canonical workspace, and limited to non-template dotenv filenames.
 - Existing/parent symlinks and a symlinked `.gitignore` are rejected.
-- Git-tracked targets are refused and Git ignore status is verified before writing.
+- Git-tracked targets are refused, case-insensitively, and Git ignore status is verified before writing. If Git cannot answer (for example a broken configuration, an untrusted repository, or missing developer tools), the write is refused rather than treated as a non-repository. Inherited `GIT_*` variables are cleared for these checks.
+- Env writes are serialized across SecretBridge processes, so concurrent sessions cannot drop each other's variables. Temporary files match the `.env*` ignore rule and receive their final permissions before they become visible.
 - Existing env files and inbound JSON-RPC messages have size caps.
 - Secret variables with public client-bundle prefixes are rejected.
 - Labels reject line breaks, control characters, and Unicode bidirectional overrides.
+- Shared servers use `--workspace-per-request`: an absolute existing `workspace_root` is required on every call. Scope is validated before any credential access and never taken from a previous call. Fixed-root servers reject a supplied workspace that differs from their configured root.
+- A request workspace is routing context, not an authorization grant. Credential-specific workspace grants remain required for every export; choosing a path does not grant access to stored secrets.
 - Cross-workspace reuse requires a one-time native grant.
-- Env writes and deletions require a local dialog that defaults to cancel.
+- Save & Use authorizes credential storage and subsequent env writes within the displayed workspace. Existing workspace grants have the same meaning starting in 0.2; there is no per-write approval popup.
+- Cross-workspace grants and deletions retain a native confirmation. Closing or cancelling a dialog never grants access.
+- A credential can be replaced only from a workspace where it is available. Deletion works from any workspace; its confirmation names the requesting workspace and how many workspaces use the credential.
+- New labels, descriptions, and resolved workspace paths may not contain control, directional, invisible, line-separator, or tag characters, so request text cannot push the real workspace out of a dialog. Records written by earlier releases are read under the rules they were written with. The registry refuses writes that its reads would reject.
+- On macOS and Linux, if the broker exits while a popup is open, the popup closes itself and stores nothing.
 - The tool result reports names and status, never file contents.
 - `.env*` is automatically gitignored while template files remain committable and cannot receive secrets.
 - Registry writes use a lock and atomic replacement; credential/metadata creation and replacement have compensating rollback.
@@ -67,7 +74,7 @@ Not trusted:
 1. **A `.env` file is readable data.** Once approved and written, another local process—or an AI with sufficient filesystem access—may read it. File materialization is a compatibility feature, not the strongest isolation mode.
 2. **Arbitrary local execution and secrecy are fundamentally in tension.** If a model can run any command with a credential in its environment, it can ask that command to print or transmit the credential. This prototype therefore does not expose a generic `run_with_secrets` tool.
 3. **Same-user compromise is outside the threat model.** Malware may capture input, tamper with an executable, read a materialized `.env` file, or invoke OS credential APIs. Process-name blocklists create false confidence and are intentionally not used.
-4. **Client identity is display context, not authentication.** `--client-name` can be chosen by whoever launches the server. Verify the requested label, destination, and variable names rather than trusting the client name alone.
+4. **Client identity is display context, not authentication.** `--client-name` can be chosen by whoever launches the server. Verify the requested label and workspace rather than trusting the client name alone.
 5. **UI spoofing remains possible.** Install only a binary you built or verified, and do not approve surprising prompts.
 6. **Memory zeroization is best effort.** GUI and OS APIs may make internal copies outside Rust's control.
 7. **Windows Credential Manager is not an app-isolation boundary.** Generic credentials are readable by other processes under the same Windows user. This does not expose the value to MCP by itself, but it means SecretBridge does not protect a compromised Windows account.

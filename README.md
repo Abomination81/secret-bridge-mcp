@@ -10,7 +10,7 @@
 
 SecretBridge lets an AI request a credential without asking you to paste it into chat. It opens a native password dialog, stores the value in macOS Keychain or Windows Credential Manager, and returns only an opaque ID through MCP. It is a local application: it has no server, account, telemetry, or network listener.
 
-The model can later ask SecretBridge to place selected credentials into an approved local `.env` file. Secret values never appear in MCP requests, responses, labels, metadata, or audit logs.
+The model can later ask SecretBridge to place selected credentials into a local `.env` file within the workspace you authorized with **Save & Use**. Secret values never appear in MCP requests, responses, labels, metadata, or audit logs.
 
 **[Open the visual installation guide](https://abomination81.github.io/secret-bridge-mcp/)**
 
@@ -25,7 +25,7 @@ flowchart LR
     Popup -->|"in-process success state"| MCP
     MCP -->|"opaque secret_id only"| AI
     AI -->|"secret_id + env name + relative path"| MCP
-    MCP -->|"native approval with exact target"| User
+    MCP -->|"check workspace grant + safe destination"| MCP
     MCP -->|"local retrieval and write"| Env["gitignored .env file"]
 ```
 
@@ -35,7 +35,7 @@ There is deliberately no `secret_get`, `secret_reveal`, clipboard, HTTP, or netw
 
 - `secret_request`: shows a hidden-input popup, stores a new value, or reuses an existing label. The result contains only an opaque `secret_id`.
 - `secret_list`: returns non-sensitive labels, purposes, IDs, and timestamps.
-- `env_write`: shows a second approval and merges selected secrets into `.env`, `.env.*`, or `.dev.vars` beneath one configured workspace.
+- `env_write`: uses the existing workspace grant to merge selected secrets into `.env`, `.env.*`, or `.dev.vars` beneath the workspace named in that request, without a second popup.
 - `secret_delete`: shows a confirmation and removes the stored credential and its metadata.
 
 After a new value is submitted and OS storage succeeds, `secret_request` explicitly returns:
@@ -55,14 +55,18 @@ The accompanying MCP message tells the AI that secure entry was confirmed and it
 
 `env_write` also:
 
-- rejects absolute paths, `..`, symlink targets/parents, and paths outside the configured workspace;
-- refuses committable templates such as `.env.example`, targets already tracked by Git, and targets Git does not report as ignored;
+- rejects absolute paths, `..`, symlink targets/parents, and paths outside the request workspace;
+- refuses committable templates such as `.env.example`, targets already tracked by Git (in any letter case), and targets Git does not report as ignored, and refuses the write if Git cannot answer;
 - rejects client-bundled prefixes such as `NEXT_PUBLIC_`, `VITE_`, and `REACT_APP_`;
 - adds safe `.env*`/`.dev.vars` ignore rules and template exceptions to the workspace `.gitignore` when needed;
 - refuses a symlinked `.gitignore`, caps existing env files at 1 MiB, writes mode `0600` on macOS, and preserves unrelated existing variables;
 - records only metadata in a local audit log.
 
-Credentials are granted to the workspace where they are first requested. Reuse there is automatic. Reuse from another workspace requires a one-time native approval; every `.env` write still gets its own approval.
+Submitting **Save & Use** grants storage and use within the workspace displayed in the popup, including subsequent `.env` writes without another approval. Reuse from another workspace still requires a one-time native grant. Deletion still requires confirmation.
+
+On macOS the popup is a native alert with the SecretBridge icon, system typography, and a workspace well that shows the folder Save & Use authorizes and its full location. It follows your light or dark appearance. A line break at the start or end, such as the one a copied key often carries, is not stored; spaces are kept. Drag the dialog background to move it. The popup grows to fit the request message. Unusually long messages have a visible scrollbar, while the input and buttons stay visible. Standard editing shortcuts, including ⌘V, work in the secure field; Return submits a filled credential and Escape cancels. Windows uses the simplified light layout with a dedicated drag area.
+
+**Upgrading to 0.2:** existing workspace grants also authorize `.env` writes without a second popup. This changes the earlier per-write approval behavior; the workspace, path, Git-ignore, and variable-name checks remain enforced.
 
 ## Install from GitHub
 
@@ -108,16 +112,20 @@ Convenience installers build the locked dependency graph from source and copy th
 .\scripts\install.ps1
 ```
 
-No API key or secret is needed to build or run the MCP server itself.
+No API key or secret is needed to build or run the MCP server itself. After replacing an installed binary, restart the MCP client so its persistent broker uses the new version. Older brokers can still open the updated entry dialog, but keep their old per-write approval behavior until restarted.
+
+**Upgrading to 0.3:** replace `--workspace-root` and its path with `--workspace-per-request` in shared MCP entries, then restart the client to refresh tool schemas. Existing credentials and workspace grants stay intact. A credential saved to the wrong workspace by an older setup can be reused by label in the intended workspace through its native grant; no value needs to be copied through chat.
 
 ## Configure an AI client
 
-Use an absolute binary path and an absolute workspace root. Configure one server entry per workspace so `.env` writes stay narrowly scoped.
+Use an absolute binary path. For an installation shared by multiple chats or projects, use **`--workspace-per-request`**. Every tool call must supply `workspace_root` with the current task's absolute project directory. The popup, grants, receipts, and env writes all use that request's directory; there is no remembered last project and no fallback when the argument is missing.
+
+A dedicated project-only server can still use `--workspace-root /absolute/path/to/project`. If a call supplies a different `workspace_root`, it is rejected. Without either flag, legacy installations use the launch directory. Do not use a fixed project path in a global entry that should serve unrelated projects.
 
 ### Codex and the ChatGPT desktop app
 
 ```sh
-codex mcp add secret-bridge -- /absolute/path/to/secret-bridge-mcp --workspace-root /absolute/path/to/project --client-name Codex
+codex mcp add secret-bridge -- /absolute/path/to/secret-bridge-mcp --workspace-per-request --client-name Codex
 ```
 
 Equivalent `~/.codex/config.toml`:
@@ -125,7 +133,7 @@ Equivalent `~/.codex/config.toml`:
 ```toml
 [mcp_servers.secret-bridge]
 command = "/absolute/path/to/secret-bridge-mcp"
-args = ["--workspace-root", "/absolute/path/to/project", "--client-name", "Codex"]
+args = ["--workspace-per-request", "--client-name", "Codex"]
 default_tools_approval_mode = "writes"
 ```
 
@@ -134,7 +142,7 @@ The ChatGPT desktop app, Codex CLI, and Codex IDE extension share this configura
 ### Claude Code
 
 ```sh
-claude mcp add --scope user --transport stdio secret-bridge -- /absolute/path/to/secret-bridge-mcp --workspace-root /absolute/path/to/project --client-name "Claude Code"
+claude mcp add --scope user --transport stdio secret-bridge -- /absolute/path/to/secret-bridge-mcp --workspace-per-request --client-name "Claude Code"
 ```
 
 ### Claude Desktop and other JSON-configured clients
@@ -145,8 +153,7 @@ claude mcp add --scope user --transport stdio secret-bridge -- /absolute/path/to
     "secret-bridge": {
       "command": "/absolute/path/to/secret-bridge-mcp",
       "args": [
-        "--workspace-root",
-        "/absolute/path/to/project",
+        "--workspace-per-request",
         "--client-name",
         "Claude Desktop"
       ]
@@ -165,8 +172,7 @@ Add this to Gemini CLI's `settings.json` and keep `trust` set to `false` so the 
     "secret-bridge": {
       "command": "/absolute/path/to/secret-bridge-mcp",
       "args": [
-        "--workspace-root",
-        "/absolute/path/to/project",
+        "--workspace-per-request",
         "--client-name",
         "Gemini CLI"
       ],
@@ -194,9 +200,9 @@ sh ./scripts/enable-defaults.sh both
 
 Use `codex` or `claude` instead of `both` to configure only one client. The scripts install the shared [credential instructions](docs/client-instructions.md) in the clients' user-level instruction files. They preserve existing preferences and update only their marked section when rerun. They respect `CODEX_HOME` and `CLAUDE_CONFIG_DIR`; Codex's nonempty `AGENTS.override.md` is selected when present.
 
-Start a new Codex task or Claude Code session afterward. When a task needs a credential, the AI is instructed to discover SecretBridge, check saved labels, reuse an appropriate credential or open the popup, and use `env_write` for an approved destination. You do not need to mention the MCP in each request. If the tools are unavailable, it helps resolve the connection instead of asking you to paste a key in chat.
+Start a new Codex task or Claude Code session afterward. When a task needs a credential, the AI is instructed to discover SecretBridge, check saved labels, reuse an appropriate credential or open the popup, and use `env_write` within the authorized workspace without asking for permission again. You do not need to mention the MCP in each request. If the tools are unavailable, it helps resolve the connection instead of asking you to paste a key in chat.
 
-These are persistent defaults, not a guarantee of every model decision. They do not change tool permissions, bypass native approvals, or expand the configured workspace. A global MCP entry with a fixed `--workspace-root` still writes only within that root; configure an entry for another project before writing there. Claude Desktop chat does not automatically load Claude Code's `CLAUDE.md`.
+These are persistent defaults, not a guarantee of every model decision. They do not change tool permissions, bypass native approvals, or expand the configured workspace. Use `--workspace-per-request` for a global entry. Never repoint a global fixed root when switching tasks; existing chats can retain the old process and scope. Claude Desktop chat does not automatically load Claude Code's `CLAUDE.md`.
 
 To undo the preference, remove just the section between the SecretBridge managed markers in the affected instruction file. MCP registration and saved credentials are separate and remain available. See [Codex instruction discovery](https://developers.openai.com/codex/guides/agents-md/) and [Claude Code memory](https://code.claude.com/docs/en/memory) for client behavior.
 
@@ -210,8 +216,7 @@ JSON paths must escape backslashes:
     "secret-bridge": {
       "command": "C:\\Users\\you\\AppData\\Local\\SecretBridge\\secret-bridge-mcp.exe",
       "args": [
-        "--workspace-root",
-        "C:\\Users\\you\\src\\my-project",
+        "--workspace-per-request",
         "--client-name",
         "AI client"
       ]
@@ -226,11 +231,11 @@ JSON paths must escape backslashes:
 
 With the default credential instructions installed, this is enough; you do not need to remind the AI about SecretBridge.
 
-The AI calls `secret_request`. You see a native dialog labeled, for example, “Stripe test secret key for Acme billing,” paste the value there, and click **Save securely**. The AI receives an ID such as `sb_…`, then calls `env_write`. A second popup shows the full destination and mapping before anything is written.
+The AI calls `secret_request` with the current project's `workspace_root`. You see a native dialog labeled, for example, “Stripe test secret key for Acme billing,” paste the value there, and click **Save & Use**. The popup shows the workspace this authorizes. The AI receives an ID such as `sb_…`, then calls `env_write` with the same `workspace_root` and a relative path, without a second popup.
 
 ## Security boundary
 
-SecretBridge is designed to keep the secret out of AI conversations, MCP messages, command history, and logs while it is collected and reused. It is not designed to hide an approved `.env` file from software running on the same computer. An AI client with unrestricted filesystem permissions can potentially read that file. Review the path and variable names in the approval dialog.
+SecretBridge is designed to keep the secret out of AI conversations, MCP messages, command history, and logs while it is collected and reused. It is not designed to hide an approved `.env` file from software running on the same computer. An AI client with unrestricted filesystem permissions can potentially read that file. Review the workspace before submitting. Save & Use authorizes later dotenv writes anywhere beneath that workspace that pass the file and variable-name checks.
 
 On macOS, SecretBridge enables Secure Event Input for the secret window. After a paste event it replaces the clipboard contents with an empty value. These are small hygiene measures, not malware detection.
 

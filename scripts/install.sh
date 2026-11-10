@@ -5,7 +5,9 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(dirname -- "$script_dir")
 install_dir=${SECRET_BRIDGE_INSTALL_DIR:-"$HOME/.local/bin"}
 
-cargo build --release --locked --manifest-path "$project_dir/Cargo.toml"
+# Build into the project target directory explicitly, so a CARGO_TARGET_DIR or build.target-dir
+# setting cannot leave a stale binary at the path copied below.
+cargo build --release --locked --manifest-path "$project_dir/Cargo.toml" --target-dir "$project_dir/target"
 mkdir -p "$install_dir"
 if [ -L "$install_dir/secret-bridge-mcp" ]; then
     echo "Refusing to replace a symlink at $install_dir/secret-bridge-mcp" >&2
