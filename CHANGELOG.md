@@ -2,7 +2,7 @@
 
 All notable changes to SecretBridge are documented here.
 
-## 0.4.0 - 2026-11-09
+## 0.4.0 - 2026-11-10
 
 ### macOS popup
 
@@ -32,7 +32,7 @@ All notable changes to SecretBridge are documented here.
 - `install.ps1` stops when `cargo build` fails instead of installing a stale binary, and both install scripts build into the project's own `target` directory.
 - `enable-defaults.sh` no longer deletes the managed block when the repository path contains a backslash or the template cannot be read, and both setup scripts require exactly one block in the template. `enable-defaults.ps1` resolves relative directories against the current PowerShell location.
 - On Linux, prompts keep working after an in-place upgrade while a server is running.
-- CI and releases build on macOS 15 runners (GitHub retires macOS 14 on 2026-11-02). Updated the yanked `clipboard-win` and documented the Linux-only D-Bus crates flagged as unmaintained.
+- CI and releases build on macOS 15 runners (GitHub retires macOS 14 on 2026-11-02). Updated the yanked `clipboard-win` and the Linux-only `async-executor`, and documented the Linux-only D-Bus crates flagged as unmaintained.
 
 ## 0.3.0 - 2026-10-30
 
